@@ -74,6 +74,7 @@ fi
 # --- 1. 环境与基础配置 ---
 SHOW_HELP=false
 FORCE_REFRESH=false
+CHECK_ONLY=false
 QUERY_ARGS=()
 OPENCODE_MODEL="${PAC_OPENCODE_MODEL:-opencode/deepseek-v4-flash-free}"
 
@@ -89,6 +90,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --refresh|-y)
             FORCE_REFRESH=true
+            shift
+            ;;
+        --check|-c)
+            CHECK_ONLY=true
             shift
             ;;
         --ai-model)
@@ -113,6 +118,7 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[OPTS]="选项："
     MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
     MSG[OPT_REFRESH]="  --refresh, -y 强制拉取并刷新 AUR 软件包本地缓存列表"
+    MSG[OPT_CHECK]="  --check, -c   仅审查 AUR 包，不安装"
     MSG[OPT_AI_MODEL]="  --ai-model <模型> 指定 opencode 审查模型 (也可用 PAC_OPENCODE_MODEL)"
     MSG[FEAT]="功能特性："
     MSG[FEAT_1]="- 准确状态：显示 [已安装] 标记"
@@ -126,6 +132,7 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[INSTALLED]="[已安装]"
     MSG[INSTALLING]=">> 准备安装："
     MSG[HEADER]="Tab:多选 | Enter:安装 | Ctrl+R:强制刷新 | Esc:退出"
+    MSG[HEADER_CHECK]="Tab:多选 | Enter:审查 | Ctrl+R:强制刷新 | Esc:退出"
     MSG[EXEC]="> 正在执行: "
     MSG[HINT]="如需重试或记录，可复制以下命令："
     MSG[REVIEWING_AUR]=">> 正在审查 AUR 包："
@@ -155,6 +162,10 @@ if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
     MSG[SKIPPED]="已跳过安装："
     MSG[NO_OPENCODE]="未找到 opencode，跳过 AI 审查并继续正常安装 AUR 包。"
     MSG[NO_REVIEW_PROMPT]="未找到 AUR 审查提示词，跳过 AI 审查并继续正常安装 AUR 包。"
+    MSG[CHECK_NO_OPENCODE]="未找到 opencode，无法执行 AUR 审查。"
+    MSG[CHECK_NO_REVIEW_PROMPT]="未找到 AUR 审查提示词，无法执行 AUR 审查。"
+    MSG[CHECK_SKIP_REPO]="仅审查模式会跳过非 AUR 包："
+    MSG[CHECK_DONE]="审查完成，未执行安装。"
     MSG[ERR_REVIEW]="错误：AUR 审查失败。"
     MSG[REVIEW_FAILED_CONFIRM]="AUR 审查失败，仍然继续安装 %s? [y/N] "
 else
@@ -162,6 +173,7 @@ else
     MSG[OPTS]="Options:"
     MSG[OPT_HELP]="  --help, -h    Show this help and exit"
     MSG[OPT_REFRESH]="  --refresh, -y Force refresh AUR package cache list"
+    MSG[OPT_CHECK]="  --check, -c   Review AUR packages only; do not install"
     MSG[OPT_AI_MODEL]="  --ai-model <model> Set opencode review model (or PAC_OPENCODE_MODEL)"
     MSG[FEAT]="Features:"
     MSG[FEAT_1]="- Accurate status: [Installed] tag"
@@ -175,6 +187,7 @@ else
     MSG[INSTALLED]="[Installed]"
     MSG[INSTALLING]=">> Installing:"
     MSG[HEADER]="Tab:Multi-Select | Enter:Install | Ctrl+R:Force Refresh | Esc:Exit"
+    MSG[HEADER_CHECK]="Tab:Multi-Select | Enter:Review | Ctrl+R:Force Refresh | Esc:Exit"
     MSG[EXEC]="> Executing: "
     MSG[HINT]="For retry or logging, copy the command below:"
     MSG[REVIEWING_AUR]=">> Reviewing AUR package:"
@@ -204,6 +217,10 @@ else
     MSG[SKIPPED]="Skipped install:"
     MSG[NO_OPENCODE]="opencode not found; skipping AI review and continuing normal AUR install."
     MSG[NO_REVIEW_PROMPT]="AUR review prompt not found; skipping AI review and continuing normal AUR install."
+    MSG[CHECK_NO_OPENCODE]="opencode not found; cannot run AUR review."
+    MSG[CHECK_NO_REVIEW_PROMPT]="AUR review prompt not found; cannot run AUR review."
+    MSG[CHECK_SKIP_REPO]="Check-only mode skips non-AUR packages:"
+    MSG[CHECK_DONE]="Review completed; no install was performed."
     MSG[ERR_REVIEW]="Error: AUR review failed."
     MSG[REVIEW_FAILED_CONFIRM]="AUR review failed. Continue installing %s anyway? [y/N] "
 fi
@@ -216,6 +233,7 @@ Usage: ${0##*/} [options] [query]
 ${MSG[OPTS]}
 ${MSG[OPT_HELP]}
 ${MSG[OPT_REFRESH]}
+${MSG[OPT_CHECK]}
 ${MSG[OPT_AI_MODEL]}
 
 Description:
@@ -378,26 +396,39 @@ aur_build_dir() {
     local pkg="$1"
 
     if [[ "$AUR_HELPER" == "paru" ]]; then
-        printf '%s/paru/clone/%s' "${XDG_CACHE_HOME:-$HOME/.cache}" "$pkg"
+        printf '%s/paru/clone/.pac-review/%s' "${XDG_CACHE_HOME:-$HOME/.cache}" "$pkg"
     else
-        printf '%s/yay/%s' "${XDG_CACHE_HOME:-$HOME/.cache}" "$pkg"
+        printf '%s/yay/.pac-review/%s' "${XDG_CACHE_HOME:-$HOME/.cache}" "$pkg"
     fi
 }
 
 fetch_aur_build_files() {
     local pkg="$1"
-    local build_dir="$2"
-    local build_root
+    local build_root="$2"
+    local pkgbuilds=()
+    local pkgbuild
 
-    build_root="$(dirname "$build_dir")"
-    rm -rf -- "$build_dir"
+    rm -rf -- "$build_root"
     mkdir -p "$build_root"
 
     if [[ "$AUR_HELPER" == "paru" ]]; then
-        LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" --aur --clonedir "$build_root" --redownload -G "$pkg"
+        (cd "$build_root" && LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" --aur --redownload -G "$pkg")
     else
         (cd "$build_root" && LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" --aur --redownload -G "$pkg")
     fi
+
+    shopt -s nullglob
+    pkgbuilds=("$build_root"/PKGBUILD "$build_root"/*/PKGBUILD)
+    shopt -u nullglob
+
+    for pkgbuild in "${pkgbuilds[@]}"; do
+        if [[ -f "$pkgbuild" ]]; then
+            AUR_BUILD_DIR="$(dirname "$pkgbuild")"
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 select_review_model() {
@@ -431,7 +462,11 @@ PID_GEN=$!
 # --- 8. 交互式 FZF 渲染 ---
 COLOR_YELLOW=$'\033[33m'
 COLOR_RESET=$'\033[0m'
-FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
+if [[ "$CHECK_ONLY" == true ]]; then
+    FZF_HEADER="${MSG[HEADER_CHECK]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
+else
+    FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
+fi
 
 # 构造安全的 reload 命令
 RELOAD_CMD=$(printf "%q " "$SCRIPT_PATH" --generate-list true "$INSTALLED_LIST" "$AUR_CACHE" "$AUR_FILTER" "${MSG[INSTALLED]}")
@@ -469,7 +504,10 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
         fi
     done
     
-    if [[ ${#REPO_PACKAGES[@]} -gt 0 ]]; then
+    if [[ ${#REPO_PACKAGES[@]} -gt 0 && "$CHECK_ONLY" == true ]]; then
+        echo -e "\033[33m${MSG[CHECK_SKIP_REPO]}\033[0m"
+        echo "${REPO_PACKAGES[*]}"
+    elif [[ ${#REPO_PACKAGES[@]} -gt 0 ]]; then
         FINAL_CMD="$AUR_HELPER -S ${REPO_PACKAGES[*]}"
 
         echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
@@ -488,40 +526,53 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
         AUR_REVIEWED=()
         AUR_UNREVIEWED=()
         if ! command -v opencode >/dev/null 2>&1; then
-            echo -e "\033[33m${MSG[NO_OPENCODE]}\033[0m" >&2
-            AUR_UNREVIEWED+=("${AUR_PACKAGES[@]}")
+            if [[ "$CHECK_ONLY" == true ]]; then
+                echo -e "\033[31m${MSG[CHECK_NO_OPENCODE]}\033[0m" >&2
+            else
+                echo -e "\033[33m${MSG[NO_OPENCODE]}\033[0m" >&2
+                AUR_UNREVIEWED+=("${AUR_PACKAGES[@]}")
+            fi
         elif [[ -z "$AUR_REVIEW_PROMPT" ]]; then
-            echo -e "\033[33m${MSG[NO_REVIEW_PROMPT]}\033[0m" >&2
-            AUR_UNREVIEWED+=("${AUR_PACKAGES[@]}")
+            if [[ "$CHECK_ONLY" == true ]]; then
+                echo -e "\033[31m${MSG[CHECK_NO_REVIEW_PROMPT]}\033[0m" >&2
+            else
+                echo -e "\033[33m${MSG[NO_REVIEW_PROMPT]}\033[0m" >&2
+                AUR_UNREVIEWED+=("${AUR_PACKAGES[@]}")
+            fi
         else
             for pkg in "${AUR_PACKAGES[@]}"; do
-                while true; do
-                    answer=""
-                    echo -e "\n\033[35m╭─ ${MSG[REVIEW_ASK_TITLE]}\033[0m"
-                    printf "\033[35m│\033[0m ${MSG[REVIEW_ASK_BODY]}\n" "$pkg"
-                    echo -e "\033[35m│\033[0m \033[90m${MSG[REVIEW_ASK_HINT]}\033[0m"
-                    printf "\033[35m│\033[0m \033[90m${MSG[REVIEW_MODEL]}\033[0m\n" "$OPENCODE_MODEL"
-                    printf "\033[35m╰─\033[0m ${MSG[REVIEW_ASK_PROMPT]}"
-                    read -r answer || answer="n"
-                    case "${answer:-Y}" in
-                        y|Y|yes|YES)
-                            break
-                            ;;
-                        m|M)
-                            select_review_model || true
-                            ;;
-                        *)
-                            AUR_UNREVIEWED+=("$pkg")
-                            continue 2
-                            ;;
-                    esac
-                done
+                if [[ "$CHECK_ONLY" != true ]]; then
+                    while true; do
+                        answer=""
+                        echo -e "\n\033[35m╭─ ${MSG[REVIEW_ASK_TITLE]}\033[0m"
+                        printf "\033[35m│\033[0m ${MSG[REVIEW_ASK_BODY]}\n" "$pkg"
+                        echo -e "\033[35m│\033[0m \033[90m${MSG[REVIEW_ASK_HINT]}\033[0m"
+                        printf "\033[35m│\033[0m \033[90m${MSG[REVIEW_MODEL]}\033[0m\n" "$OPENCODE_MODEL"
+                        printf "\033[35m╰─\033[0m ${MSG[REVIEW_ASK_PROMPT]}"
+                        read -r answer || answer="n"
+                        case "${answer:-Y}" in
+                            y|Y|yes|YES)
+                                break
+                                ;;
+                            m|M)
+                                select_review_model || true
+                                ;;
+                            *)
+                                AUR_UNREVIEWED+=("$pkg")
+                                continue 2
+                                ;;
+                        esac
+                    done
+                fi
 
                 AUR_BUILD_DIR="$(aur_build_dir "$pkg")"
                 echo -e "\n\033[35m${MSG[FETCHING_AUR_FILES]}\033[0m $pkg"
                 echo "----------------------------------------"
                 if ! fetch_aur_build_files "$pkg" "$AUR_BUILD_DIR"; then
                     echo -e "\033[31m${MSG[ERR_REVIEW]}\033[0m $pkg" >&2
+                    if [[ "$CHECK_ONLY" == true ]]; then
+                        continue
+                    fi
                     answer=""
                     printf "${MSG[REVIEW_FAILED_CONFIRM]}" "$pkg"
                     read -r answer || answer="n"
@@ -579,6 +630,10 @@ AUR_BUILD_DIR=${AUR_BUILD_DIR}"
                     exit 130
                 elif [[ $REVIEW_STATUS -ne 0 ]]; then
                     echo -e "\033[31m${MSG[ERR_REVIEW]}\033[0m $pkg" >&2
+                    if [[ "$CHECK_ONLY" == true ]]; then
+                        rm -f "$REVIEW_LOG" "$REVIEW_REPORT"
+                        continue
+                    fi
                     answer=""
                     printf "${MSG[REVIEW_FAILED_CONFIRM]}" "$pkg"
                     read -r answer || answer="n"
@@ -597,6 +652,10 @@ AUR_BUILD_DIR=${AUR_BUILD_DIR}"
                 extract_review_report "$REVIEW_LOG" "$REVIEW_REPORT"
                 if [[ ! -s "$REVIEW_REPORT" ]]; then
                     echo -e "\033[31m${MSG[ERR_REVIEW]}\033[0m $pkg" >&2
+                    if [[ "$CHECK_ONLY" == true ]]; then
+                        rm -f "$REVIEW_LOG" "$REVIEW_REPORT"
+                        continue
+                    fi
                     answer=""
                     printf "${MSG[REVIEW_FAILED_CONFIRM]}" "$pkg"
                     read -r answer || answer="n"
@@ -614,6 +673,10 @@ AUR_BUILD_DIR=${AUR_BUILD_DIR}"
 
                 answer=""
                 echo -e "\033[90m-----------------------------------\033[0m"
+                if [[ "$CHECK_ONLY" == true ]]; then
+                    rm -f "$REVIEW_LOG" "$REVIEW_REPORT"
+                    continue
+                fi
                 if review_recommends_install "$REVIEW_REPORT" "$REVIEW_LOG"; then
                     risk_label=$(review_risk_label "$REVIEW_REPORT" "$REVIEW_LOG")
                     echo -e "\n\033[35m╭─ ${risk_label}\033[0m"
@@ -667,7 +730,9 @@ AUR_BUILD_DIR=${AUR_BUILD_DIR}"
             done
         fi
 
-        if [[ ${#AUR_REVIEWED[@]} -gt 0 ]]; then
+        if [[ "$CHECK_ONLY" == true ]]; then
+            echo -e "\033[36m${MSG[CHECK_DONE]}\033[0m"
+        elif [[ ${#AUR_REVIEWED[@]} -gt 0 ]]; then
             AUR_INSTALL_ARGS=(-Sa --noconfirm)
             if [[ "$AUR_HELPER" == "paru" ]]; then
                 AUR_INSTALL_ARGS+=(--skipreview)
