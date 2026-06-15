@@ -390,6 +390,7 @@ fetch_aur_build_files() {
     local build_root
 
     build_root="$(dirname "$build_dir")"
+    rm -rf -- "$build_dir"
     mkdir -p "$build_root"
 
     if [[ "$AUR_HELPER" == "paru" ]]; then
@@ -549,14 +550,28 @@ AUR_BUILD_DIR=${AUR_BUILD_DIR}"
                     --dir "$AUR_BUILD_DIR" \
                     -- \
                     "$REVIEW_MESSAGE" 2>&1 | tee "$REVIEW_LOG" | awk '
-                        BEGIN { gray="\033[90m"; reset="\033[0m"; report=0 }
+                        BEGIN {
+                            gray="\033[90m"
+                            cyan="\033[1;36m"
+                            yellow="\033[1;33m"
+                            green="\033[1;32m"
+                            red="\033[1;31m"
+                            reset="\033[0m"
+                            report=0
+                        }
                         /<system-reminder>/ { skip=1; next }
                         /<\/system-reminder>/ { skip=0; next }
                         skip { next }
                         /^The final line of the response MUST be/ { next }
                         /^PAC_DECISION:/ { next }
                         /^## PKGBUILD意图/ { report=1 }
-                        { if (report) print; else print gray $0 reset }
+                        !report { print gray $0 reset; next }
+                        /^## PKGBUILD意图/ { print cyan $0 reset; next }
+                        /^## 具体风险/ { print yellow $0 reset; next }
+                        /^## 🔴/ { print red $0 reset; next }
+                        /^## 🟡/ { print yellow $0 reset; next }
+                        /^## 🟢/ { print green $0 reset; next }
+                        { print }
                     '
                 REVIEW_STATUS=${PIPESTATUS[0]}
                 set -e
@@ -581,7 +596,20 @@ AUR_BUILD_DIR=${AUR_BUILD_DIR}"
 
                 extract_review_report "$REVIEW_LOG" "$REVIEW_REPORT"
                 if [[ ! -s "$REVIEW_REPORT" ]]; then
-                    REVIEW_REPORT="$REVIEW_LOG"
+                    echo -e "\033[31m${MSG[ERR_REVIEW]}\033[0m $pkg" >&2
+                    answer=""
+                    printf "${MSG[REVIEW_FAILED_CONFIRM]}" "$pkg"
+                    read -r answer || answer="n"
+                    case "$answer" in
+                        y|Y|yes|YES)
+                            AUR_UNREVIEWED+=("$pkg")
+                            ;;
+                        *)
+                            echo -e "\033[33m${MSG[SKIPPED]}\033[0m $pkg"
+                            ;;
+                    esac
+                    rm -f "$REVIEW_LOG" "$REVIEW_REPORT"
+                    continue
                 fi
 
                 answer=""
