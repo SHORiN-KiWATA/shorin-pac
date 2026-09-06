@@ -16,8 +16,9 @@ optdepends=(
     'yay: fallback AUR helper (pac can install it for you)'
     'flatpak: list and remove Flatpak apps in pacr'
     'trash-cli: send leftovers to the trash instead of deleting'
-    'opencode: local AI backend for AUR review'
-    'claude-code: local AI backend for AUR review'
+    'claude-code: AI backend via the claude CLI subscription'
+    'opencode: AI backend via the opencode CLI'
+    'miyu: AI backend via Miyu, and import of Miyu provider settings'
 )
 provides=("${_pkgname}")
 conflicts=("${_pkgname}")

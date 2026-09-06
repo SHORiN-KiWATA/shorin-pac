@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# 描述： 配置 AI 供应商与模型
+# Description: Configure the AI provider and model
+# ==============================================================================
+# shorin-pac config [子命令]
+#   (无参数)              交互菜单
+#   select                fzf 选择供应商/模型
+#   show                  显示当前配置与所有可用供应商
+#   set <provider[:model]> 直接设置
+#   add                   交互添加自定义 HTTP 供应商
+#   remove [id]           删除自定义供应商
+#   tools on|off          是否允许 CLI 后端使用只读工具
+#   miyu on|off           是否导入 Miyu 的供应商
+#   test                  用当前供应商发一条测试消息
+#   path                  打印配置文件路径
+# ==============================================================================
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+if [[ -r "${SCRIPT_DIR}/lib/ai.sh" ]]; then
+    # shellcheck source=../lib/ai.sh
+    source "${SCRIPT_DIR}/lib/ai.sh"
+elif [[ -r "${SCRIPT_DIR}/../lib/ai.sh" ]]; then
+    source "${SCRIPT_DIR}/../lib/ai.sh"
+else
+    echo "shorin-pac-config: lib/ai.sh not found" >&2
+    exit 1
+fi
+ai_init || exit 1
+
+C_CYAN=$'\033[36m'; C_YEL=$'\033[33m'; C_GRAY=$'\033[90m'; C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_RST=$'\033[0m'
+
+declare -A T
+if $AI_IS_CN; then
+    T[MENU_HEADER]="shorin-pac AI 配置 | Enter:进入 | Esc:退出"
+    T[M_SELECT]="选择供应商 / 模型"
+    T[M_ADD]="添加自定义 HTTP 供应商（OpenAI 兼容 / Anthropic）"
+    T[M_REMOVE]="删除自定义供应商"
+    T[M_TOOLS]="CLI 后端允许只读工具"
+    T[M_MIYU]="导入 Miyu 的供应商配置"
+    T[M_TEST]="测试当前供应商"
+    T[M_SHOW]="查看当前配置"
+    T[M_QUIT]="退出"
+    T[CURRENT]="当前："
+    T[ON]="开"
+    T[OFF]="关"
+    T[ADD_ID]="供应商 id（字母数字和 - _，例如 deepseek）: "
+    T[ADD_NAME]="显示名称（回车用 id）: "
+    T[ADD_URL]="API 地址（例如 https://api.deepseek.com/v1）: "
+    T[ADD_PROTO]="协议"
+    T[ADD_KEY]="API key（可写 \$env:变量名；输入不回显）: "
+    T[ADD_FETCH]="正在从 /models 获取模型列表..."
+    T[ADD_MODELS_HEADER]="Tab:多选模型 | Enter:确认 | Esc:手动输入"
+    T[ADD_MODELS_MANUAL]="模型名（逗号分隔）: "
+    T[ADD_DONE]="已保存供应商："
+    T[ADD_EXISTS]="错误：该 id 已存在。"
+    T[ADD_INVALID_ID]="错误：id 不合法。"
+    T[REMOVE_HEADER]="选择要删除的自定义供应商 | Esc:取消"
+    T[REMOVE_NONE]="没有自定义供应商。"
+    T[REMOVED]="已删除："
+    T[TEST_SENDING]="发送测试消息到："
+    T[TEST_OK]="测试通过，回复："
+    T[TEST_FAIL]="测试失败。"
+    T[SHOW_SELECTED]="当前选择"
+    T[SHOW_TOOLS]="CLI 只读工具"
+    T[SHOW_MIYU]="导入 Miyu"
+    T[SHOW_PROVIDERS]="可用供应商"
+    T[SHOW_CONFIG]="配置文件"
+    T[SET_BAD]="错误：找不到供应商："
+else
+    T[MENU_HEADER]="shorin-pac AI settings | Enter:open | Esc:quit"
+    T[M_SELECT]="Select provider / model"
+    T[M_ADD]="Add a custom HTTP provider (OpenAI-compatible / Anthropic)"
+    T[M_REMOVE]="Remove a custom provider"
+    T[M_TOOLS]="Allow read-only tools for CLI backends"
+    T[M_MIYU]="Import providers from Miyu"
+    T[M_TEST]="Test the current provider"
+    T[M_SHOW]="Show current settings"
+    T[M_QUIT]="Quit"
+    T[CURRENT]="Current:"
+    T[ON]="on"
+    T[OFF]="off"
+    T[ADD_ID]="Provider id (letters, digits, - _; e.g. deepseek): "
+    T[ADD_NAME]="Display name (Enter = id): "
+    T[ADD_URL]="API base URL (e.g. https://api.deepseek.com/v1): "
+    T[ADD_PROTO]="Protocol"
+    T[ADD_KEY]="API key (\$env:VAR allowed; input hidden): "
+    T[ADD_FETCH]="Fetching model list from /models..."
+    T[ADD_MODELS_HEADER]="Tab:multi-select models | Enter:confirm | Esc:type manually"
+    T[ADD_MODELS_MANUAL]="Model names (comma separated): "
+    T[ADD_DONE]="Saved provider:"
+    T[ADD_EXISTS]="Error: that id already exists."
+    T[ADD_INVALID_ID]="Error: invalid id."
+    T[REMOVE_HEADER]="Select a custom provider to remove | Esc:cancel"
+    T[REMOVE_NONE]="No custom providers."
+    T[REMOVED]="Removed:"
+    T[TEST_SENDING]="Sending a test message to:"
+    T[TEST_OK]="Test passed, reply:"
+    T[TEST_FAIL]="Test failed."
+    T[SHOW_SELECTED]="Selected"
+    T[SHOW_TOOLS]="CLI read-only tools"
+    T[SHOW_MIYU]="Import Miyu"
+    T[SHOW_PROVIDERS]="Available providers"
+    T[SHOW_CONFIG]="Config file"
+    T[SET_BAD]="Error: provider not found:"
+fi
+
+onoff() { if [[ "$1" == true ]]; then printf '%s' "${T[ON]}"; else printf '%s' "${T[OFF]}"; fi; }
+
+cmd_show() {
+    ai_resolve || true
+    echo "${C_CYAN}${T[SHOW_SELECTED]}${C_RST}: $(ai_describe_selection 2>/dev/null || echo '-')"
+    echo "${C_CYAN}${T[SHOW_TOOLS]}${C_RST}: $(onoff "$AI_ALLOW_TOOLS")"
+    echo "${C_CYAN}${T[SHOW_MIYU]}${C_RST}: $(onoff "$AI_IMPORT_MIYU")"
+    echo "${C_CYAN}${T[SHOW_CONFIG]}${C_RST}: $AI_CONFIG_FILE"
+    echo "${C_CYAN}${T[SHOW_PROVIDERS]}${C_RST}:"
+    ai_all_providers | jq -r '[.id, .display_name, "[\(.source)/\(.protocol)]", (.models | join(", "))] | @tsv' \
+        | while IFS=$'\t' read -r id name tag models; do
+            printf '  %-18s %-40s %-24s %s\n' "$id" "$name" "$tag" "$models"
+        done
+}
+
+cmd_set() {
+    local spec="$1"
+    if ai_resolve "$spec" && [[ "${AI_AUTO_SELECTED:-false}" != true ]]; then
+        ai_config_update '.selected = {provider: $p, model: $m}' --arg p "$AI_PROVIDER_ID" --arg m "$AI_MODEL"
+        echo "${C_CYAN}$(ai_msg SELECTED)${C_RST} $(ai_describe_selection)"
+    else
+        echo "${T[SET_BAD]} $spec" >&2
+        return 1
+    fi
+}
+
+cmd_add() {
+    local id name url proto key models_json fetched chosen
+    read -r -p "${T[ADD_ID]}" id
+    [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "${T[ADD_INVALID_ID]}" >&2; return 1; }
+    if ai_all_providers | jq -e --arg id "$id" 'select(.id == $id)' >/dev/null; then
+        echo "${T[ADD_EXISTS]}" >&2; return 1
+    fi
+    read -r -p "${T[ADD_NAME]}" name; [[ -n "$name" ]] || name="$id"
+    read -r -p "${T[ADD_URL]}" url; url="${url%/}"
+    proto=$(printf '%s\n' "openai-chat" "anthropic" | fzf --height=6 --layout=reverse --header "${T[ADD_PROTO]}") || return 1
+    read -r -s -p "${T[ADD_KEY]}" key; echo
+    models_json='[]'
+    if [[ "$proto" == "openai-chat" ]]; then
+        echo "${C_GRAY}${T[ADD_FETCH]}${C_RST}"
+        fetched=$(curl -sS --max-time 20 -H "Authorization: Bearer $(ai_resolve_key "$key")" "${url}/models" 2>/dev/null \
+            | jq -r '.data[]?.id // empty' 2>/dev/null | sort -u || true)
+        if [[ -n "$fetched" ]]; then
+            chosen=$(printf '%s\n' "$fetched" | fzf --multi --height=60% --layout=reverse --border --header "${T[ADD_MODELS_HEADER]}" || true)
+            [[ -n "$chosen" ]] && models_json=$(printf '%s\n' "$chosen" | jq -R . | jq -s .)
+        fi
+    fi
+    if [[ "$models_json" == '[]' ]]; then
+        read -r -p "${T[ADD_MODELS_MANUAL]}" chosen
+        models_json=$(printf '%s' "$chosen" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' | jq -R . | jq -s .)
+    fi
+    ai_config_update '.providers += [{id:$id, display_name:$name, base_url:$url, protocol:$proto, api_key:$key, models:$models, default_model:($models[0] // "")}]' \
+        --arg id "$id" --arg name "$name" --arg url "$url" --arg proto "$proto" --arg key "$key" --argjson models "$models_json"
+    ai_config_update '.selected = {provider: $p, model: $m}' --arg p "$id" --arg m "$(jq -r '.[0] // ""' <<< "$models_json")"
+    echo "${C_GREEN}${T[ADD_DONE]}${C_RST} $id"
+}
+
+cmd_remove() {
+    local id="${1:-}"
+    if [[ -z "$id" ]]; then
+        local rows
+        rows=$(ai_config_get '.providers[]? | "\(.id)\t\(.display_name)"')
+        [[ -n "$rows" ]] || { echo "${T[REMOVE_NONE]}"; return 0; }
+        id=$(printf '%s\n' "$rows" | fzf --delimiter='\t' --height=40% --layout=reverse --header "${T[REMOVE_HEADER]}" | cut -f1) || return 1
+        [[ -n "$id" ]] || return 0
+    fi
+    ai_config_update '.providers = [.providers[] | select(.id != $id)] | if .selected.provider == $id then .selected = {provider:"", model:""} else . end' --arg id "$id"
+    echo "${C_YEL}${T[REMOVED]}${C_RST} $id"
+}
+
+cmd_toggle() {
+    local key="$1" value="$2"
+    case "$value" in
+        on|true|1) value=true ;;
+        off|false|0) value=false ;;
+        *) echo "usage: shorin-pac config $key on|off" >&2; return 1 ;;
+    esac
+    ai_config_update ".${key} = \$v" --argjson v "$value"
+    ai_init
+}
+
+cmd_test() {
+    ai_resolve || return 1
+    echo "${C_GRAY}${T[TEST_SENDING]}${C_RST} $(ai_describe_selection)"
+    local tmp sys user out
+    tmp=$(mktemp -d -t shorin-pac-test.XXXXXX)
+    sys="$tmp/sys"; user="$tmp/user"; out="$tmp/out"
+    printf 'You are a connectivity test. Reply with exactly the word PONG and nothing else.' > "$sys"
+    printf 'ping' > "$user"
+    if ai_complete "$sys" "$user" "$out" "$tmp" && [[ -s "$out" ]]; then
+        echo "${C_GREEN}${T[TEST_OK]}${C_RST} $(head -c 200 "$out")"
+        rm -rf "$tmp"; return 0
+    fi
+    echo "${C_RED}${T[TEST_FAIL]}${C_RST}" >&2
+    rm -rf "$tmp"; return 1
+}
+
+cmd_menu() {
+    command -v fzf >/dev/null 2>&1 || { echo "shorin-pac config: fzf is required for the menu" >&2; exit 1; }
+    while true; do
+        ai_resolve >/dev/null 2>&1 || true
+        local choice
+        choice=$(printf '%s\n' \
+            "select	${T[M_SELECT]}	${T[CURRENT]} $(ai_describe_selection 2>/dev/null || echo -)" \
+            "add	${T[M_ADD]}	" \
+            "remove	${T[M_REMOVE]}	" \
+            "tools	${T[M_TOOLS]}	${T[CURRENT]} $(onoff "$AI_ALLOW_TOOLS")" \
+            "miyu	${T[M_MIYU]}	${T[CURRENT]} $(onoff "$AI_IMPORT_MIYU")" \
+            "test	${T[M_TEST]}	" \
+            "show	${T[M_SHOW]}	" \
+            "quit	${T[M_QUIT]}	" \
+            | fzf --delimiter='\t' --with-nth=2.. --height=40% --layout=reverse --border --header "${T[MENU_HEADER]}" \
+            | cut -f1) || return 0
+        case "$choice" in
+            select) ai_select_interactive || true ;;
+            add) cmd_add || true ;;
+            remove) cmd_remove || true ;;
+            tools) if [[ "$AI_ALLOW_TOOLS" == true ]]; then cmd_toggle allow_tools off; else cmd_toggle allow_tools on; fi ;;
+            miyu) if [[ "$AI_IMPORT_MIYU" == true ]]; then cmd_toggle import_miyu off; else cmd_toggle import_miyu on; fi ;;
+            test) cmd_test || true ;;
+            show) cmd_show ;;
+            quit|"") return 0 ;;
+        esac
+        [[ "$choice" == show || "$choice" == test ]] && { read -r -p "..." _ || true; }
+    done
+}
+
+case "${1:-}" in
+    "") cmd_menu ;;
+    select) ai_select_interactive ;;
+    show) cmd_show ;;
+    set) [[ -n "${2:-}" ]] || { echo "usage: shorin-pac config set <provider[:model]>" >&2; exit 1; }; cmd_set "$2" ;;
+    add) cmd_add ;;
+    remove) cmd_remove "${2:-}" ;;
+    tools) cmd_toggle allow_tools "${2:-}" ;;
+    miyu) cmd_toggle import_miyu "${2:-}" ;;
+    test) cmd_test ;;
+    path) echo "$AI_CONFIG_FILE" ;;
+    -h|--help|help) sed -n '5,17p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//' ;;
+    *) echo "shorin-pac config: unknown subcommand '$1'" >&2; exit 1 ;;
+esac
