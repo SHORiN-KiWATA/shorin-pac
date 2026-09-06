@@ -561,9 +561,10 @@ ai_cli_claude() {
     log="${out}.log"; : > "$log"
     local -a args=(-p --output-format text --no-session-persistence --strict-mcp-config --model "$AI_MODEL" --system-prompt "$(<"$sys")")
     if [[ "$AI_ALLOW_TOOLS" == true ]]; then
+        # --tools 限定内置工具集（没有 Edit/Write），--allowedTools 决定无头模式下哪些调用免审批放行；
+        # 不用 --disallowedTools：它对不存在的工具名会直接报错退出。
         args+=(--tools "Read,Glob,Grep,WebSearch,WebFetch,Bash"
-               --allowedTools "Read,Glob,Grep,WebSearch,WebFetch,Bash(ls:*),Bash(find:*),Bash(du:*),Bash(cat:*),Bash(stat:*),Bash(file:*),Bash(pacman -Q*),Bash(curl -s*)"
-               --disallowedTools "Edit,Write,MultiEdit,NotebookEdit,Bash(rm:*),Bash(mv:*),Bash(makepkg:*),Bash(sudo:*)")
+               --allowedTools "Read,Glob,Grep,WebSearch,WebFetch,Bash(ls:*),Bash(find:*),Bash(du:*),Bash(cat:*),Bash(stat:*),Bash(file:*),Bash(pacman -Q*),Bash(curl -s*)")
     else
         args+=(--tools "")
     fi

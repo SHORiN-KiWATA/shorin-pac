@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# 描述： 卸载软件包TUI
-# Description: Remove pkgs TUI
+# 描述： 卸载软件包TUI，可用 AI 检测并清理家目录残留
+# Description: Remove pkgs TUI with optional AI leftover cleanup
 # ==============================================================================
-# 启用严格的错误处理机制
+# 流程：fzf 多选要卸载的包 → 询问是否用 AI 检测残留 → 收集包元数据（卸载前）→
+#       枚举家目录候选 → AI 判断 → fzf 勾选残留 → 确认卸载 → 卸载 → 卸载成功后把勾选项移入回收站
+# 安全边界：只动家目录；黑名单路径永不列出；AI 给出的路径必须存在、在家目录内且不在黑名单；
+#           默认移入回收站（gio trash > trash-put > 手写 FreeDesktop 规范），--rm 才直接删除。
+# ==============================================================================
 set -euo pipefail
 
-# 获取脚本自身的绝对路径，确保 reload 动作在任何路径下都能正确调用自身
 SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 export SHELL=$(grep -m 1 -E '^/.*/bash$' /etc/shells || echo "/bin/bash")
 
 # --- 1. 隐藏的内部调用：用于双轨并行生成/刷新数据 ---
@@ -20,36 +24,24 @@ if [[ "${1:-}" == "--generate-data" ]]; then
             pkg_name = $1; pkg_ver = $2
             rname = (pkg_name in repo) ? repo[pkg_name] : "aur"
             color = (pkg_name in repo) ? cb : cp
-            
-            # 【修复点1】先打印带有颜色的来源，紧接着打印重置符 \033[0m
             printf "PKG: %s%s%s", color, rname, r
-            
-            # 【修复点2】将用于对齐的空格垫在重置符之后，确保 awk 切分字段不会把 \033[0m 算作独立字段
             for(i=length(rname); i<16; i++) printf " "
-            
             printf " %-35s %s\n", pkg_name, pkg_ver
         }
     '
-
     AWK_CMD_FLATPAK='
         {
             if (NF < 3) next
             app_id = $1; origin = $2
             $1=""; $2=""; name=$0
             sub(/^[ \t]+/, "", name); sub(/[ \t]+$/, "", name)
-            
-            # 同理，处理 Flatpak 的对齐与空格
             printf "FLTK: %s%s%s", cc, origin, r
             for(i=length(origin); i<16; i++) printf " "
             printf " %-35s %s\n", name, app_id
         }
     '
-
-    # 生成 Pacman 数据
     awk -v cb='\033[34m' -v cp='\033[35m' -v r='\033[0m' \
         "$AWK_CMD_PACMAN" <(pacman --color=never -Sl 2>/dev/null || true) <(pacman --color=never -Q)
-
-    # 生成 Flatpak 数据 (如果存在)
     if command -v flatpak >/dev/null 2>&1; then
         flatpak list --app --columns=application,origin,name 2>/dev/null | \
         awk -v cc='\033[36m' -v r='\033[0m' "$AWK_CMD_FLATPAK" || true
@@ -59,51 +51,155 @@ fi
 
 # --- 2. 环境与多语言字典配置 ---
 ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
+if [[ "${ORIGINAL_LANG,,}" == *zh* ]]; then
+    IS_CHINESE_LOCALE=true
+else
+    IS_CHINESE_LOCALE=false
+fi
 SHOW_HELP=false
 QUERY_ARGS=()
+CLEAN_MODE="ask"      # ask | yes | no
+SCAN_ONLY=false
+USE_RM=false
+AI_SPEC=""
+AI_MODEL_OVERRIDE=""
+MAX_CANDIDATES=80
+MAX_TOKEN_SEARCH_DEPTH=3
+
+if [[ -r "${SCRIPT_DIR}/lib/ai.sh" ]]; then
+    AI_LIB="${SCRIPT_DIR}/lib/ai.sh"
+elif [[ -r "${SCRIPT_DIR}/../lib/ai.sh" ]]; then
+    AI_LIB="${SCRIPT_DIR}/../lib/ai.sh"
+else
+    AI_LIB=""
+fi
 
 declare -A MSG
-if [[ "$ORIGINAL_LANG" == *"zh_CN"* ]]; then
-    MSG[DESC]="统一模糊搜索并卸载系统软件包 (支持 Pacman/AUR 与 Flatpak)。"
+if [[ "$IS_CHINESE_LOCALE" == true ]]; then
+    MSG[DESC]="统一模糊搜索并卸载系统软件包 (支持 Pacman/AUR 与 Flatpak)，可用 AI 检测家目录残留并移入回收站。"
     MSG[OPTS]="选项："
-    MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
+    MSG[OPT_HELP]="  --help, -h      显示此帮助信息并退出"
+    MSG[OPT_CLEAN]="  --clean         卸载前用 AI 检测残留（不再询问）"
+    MSG[OPT_NO_CLEAN]="  --no-clean      跳过残留检测（不再询问）"
+    MSG[OPT_SCAN]="  --scan          只检测并列出残留，不卸载、不删除"
+    MSG[OPT_RM]="  --rm            残留直接删除，而不是移入回收站"
+    MSG[OPT_AI]="  --ai <供应商[:模型]>  本次使用指定的 AI 供应商/模型"
+    MSG[OPT_AI_MODEL]="  --ai-model <模型>     只更换当前供应商下的模型"
     MSG[FEAT]="功能特性："
     MSG[FEAT_1]="- 大一统架构：同屏混合显示并多选 Native 包与 Flatpak 应用"
     MSG[FEAT_2]="- 彻底与安全：Pacman 递归删除配置 (-Rns)，Flatpak 原生防误删保护"
-    MSG[FEAT_3]="- 视觉标识：蓝色(官方源) | 紫色(AUR) | 青色(Flatpak)"
+    MSG[FEAT_3]="- 残留清理：卸载前 AI 判断家目录里的配置/缓存/数据残留，勾选后移入回收站"
+    MSG[FEAT_4]="- 视觉标识：蓝色(官方源) | 紫色(AUR) | 青色(Flatpak)"
     MSG[EX]="示例："
     MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
     MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为 AUR 助手。"
     MSG[REMOVING_PAC]=">> 准备卸载 (Pacman/AUR)："
     MSG[REMOVING_FPK]=">> 准备卸载 (Flatpak)："
-    MSG[HEADER]="Tab:多选 | Enter:卸载 | Ctrl+R:刷新 | Esc:退出"
+    MSG[HEADER]="Tab:多选 | Enter:卸载 | Alt+C:卸载并清残留 | Ctrl+R:刷新 | Esc:退出"
+    MSG[CLEAN_ASK_TITLE]="AI 残留检测"
+    MSG[CLEAN_ASK_BODY]="将卸载：%s"
+    MSG[CLEAN_ASK_HINT]="检测家目录中属于这些软件的配置/缓存/数据，勾选后在卸载成功后移入回收站；输入 m 更换 AI。"
+    MSG[CLEAN_ASK_MODEL]="当前 AI：%s"
+    MSG[CLEAN_ASK_PROMPT]="是否使用 AI 检测卸载残留? [y/N/m] "
+    MSG[AI_UNAVAILABLE]="AI 不可用（未找到可用供应商），将只按名称启发式列出残留。运行 shorin-pac config 可配置。"
+    MSG[COLLECTING]=">> 正在收集包信息与家目录候选..."
+    MSG[TOKENS]="匹配关键词："
+    MSG[CANDIDATES]="候选 %s 项"
+    MSG[NO_CANDIDATES]="未在家目录发现相关残留。"
+    MSG[AI_FAILED]="AI 检测失败，改为按名称启发式列出残留。"
+    MSG[AI_NOTES]="AI 备注："
+    MSG[PICK_HEADER]="Tab:勾选/取消 | Enter:确认 | Esc:不清理 | 高置信度已预选"
+    MSG[PICK_PROMPT]="残留清单> "
+    MSG[PICK_NONE]="未勾选任何残留。"
+    MSG[PICKED]="将在卸载成功后移入回收站 %s 项："
+    MSG[PICKED_RM]="将在卸载成功后直接删除 %s 项："
+    MSG[SCAN_DONE]="仅扫描模式：未卸载、未删除。"
+    MSG[CONFIRM_REMOVE]="继续卸载? [Y/n] "
+    MSG[CANCELLED]="已取消。"
+    MSG[REMOVE_FAILED]="卸载未成功完成，残留未处理。"
+    MSG[TRASHING]=">> 正在处理残留："
+    MSG[TRASHED]="已移入回收站："
+    MSG[DELETED]="已删除："
+    MSG[TRASH_FAILED]="处理失败："
+    MSG[TRASH_BACKEND]="回收站后端："
+    MSG[DONE]="完成。"
+    MSG[SRC_AI]="AI"
+    MSG[SRC_HEURISTIC]="名称匹配"
+    MSG[SRC_AI_EXTRA]="AI 自行发现"
+    MSG[CONF_HIGH]="高"
+    MSG[CONF_MEDIUM]="中"
+    MSG[CONF_LOW]="低"
 else
-    MSG[DESC]="Unified fuzzy search & remove for system packages (Pacman/AUR & Flatpak)."
+    MSG[DESC]="Unified fuzzy search & remove for system packages (Pacman/AUR & Flatpak), with AI leftover detection in HOME and trash."
     MSG[OPTS]="Options:"
-    MSG[OPT_HELP]="  --help, -h    Show this help and exit"
+    MSG[OPT_HELP]="  --help, -h      Show this help and exit"
+    MSG[OPT_CLEAN]="  --clean         Detect leftovers with AI before removal (no prompt)"
+    MSG[OPT_NO_CLEAN]="  --no-clean      Skip leftover detection (no prompt)"
+    MSG[OPT_SCAN]="  --scan          Only detect and list leftovers; do not remove or delete anything"
+    MSG[OPT_RM]="  --rm            Delete leftovers directly instead of moving them to the trash"
+    MSG[OPT_AI]="  --ai <provider[:model]>  Use this AI provider/model for this run"
+    MSG[OPT_AI_MODEL]="  --ai-model <model>       Only switch the model of the current provider"
     MSG[FEAT]="Features:"
     MSG[FEAT_1]="- Unified UI: Mix, multi-select and remove Native & Flatpak apps together"
     MSG[FEAT_2]="- Safe & Clean: Pacman recursive remove (-Rns), Flatpak native protection"
-    MSG[FEAT_3]="- Visuals: Blue(Repo) | Purple(AUR) | Cyan(Flatpak)"
+    MSG[FEAT_3]="- Leftover cleanup: AI spots config/cache/data leftovers in HOME; selected ones go to the trash after removal"
+    MSG[FEAT_4]="- Visuals: Blue(Repo) | Purple(AUR) | Cyan(Flatpak)"
     MSG[EX]="Example:"
     MSG[ERR_FZF]="Error: fzf not found."
     MSG[ERR_HELPER]="Error: Neither paru nor yay found. Please install an AUR helper."
     MSG[REMOVING_PAC]=">> Preparing to remove (Pacman/AUR):"
     MSG[REMOVING_FPK]=">> Preparing to remove (Flatpak):"
-    MSG[HEADER]="Tab:Multi-Select | Enter:Remove | Ctrl+R:Reload | Esc:Exit"
+    MSG[HEADER]="Tab:Multi-Select | Enter:Remove | Alt+C:Remove+Clean | Ctrl+R:Reload | Esc:Exit"
+    MSG[CLEAN_ASK_TITLE]="AI Leftover Detection"
+    MSG[CLEAN_ASK_BODY]="Removing: %s"
+    MSG[CLEAN_ASK_HINT]="Find config/cache/data in HOME that belong to these packages; selected items are trashed after a successful removal. Enter m to change the AI."
+    MSG[CLEAN_ASK_MODEL]="Current AI: %s"
+    MSG[CLEAN_ASK_PROMPT]="Detect leftovers with AI? [y/N/m] "
+    MSG[AI_UNAVAILABLE]="AI unavailable (no usable provider); leftovers will be listed by name heuristics only. Run 'shorin-pac config' to set one up."
+    MSG[COLLECTING]=">> Collecting package info and HOME candidates..."
+    MSG[TOKENS]="Match tokens:"
+    MSG[CANDIDATES]="%s candidates"
+    MSG[NO_CANDIDATES]="No related leftovers found in HOME."
+    MSG[AI_FAILED]="AI detection failed; falling back to name heuristics."
+    MSG[AI_NOTES]="AI notes:"
+    MSG[PICK_HEADER]="Tab:toggle | Enter:confirm | Esc:skip cleanup | high-confidence items preselected"
+    MSG[PICK_PROMPT]="leftovers> "
+    MSG[PICK_NONE]="No leftovers selected."
+    MSG[PICKED]="%s item(s) will be trashed after a successful removal:"
+    MSG[PICKED_RM]="%s item(s) will be deleted after a successful removal:"
+    MSG[SCAN_DONE]="Scan-only mode: nothing was removed or deleted."
+    MSG[CONFIRM_REMOVE]="Continue with removal? [Y/n] "
+    MSG[CANCELLED]="Cancelled."
+    MSG[REMOVE_FAILED]="Removal did not complete successfully; leftovers were left untouched."
+    MSG[TRASHING]=">> Processing leftovers:"
+    MSG[TRASHED]="Trashed:"
+    MSG[DELETED]="Deleted:"
+    MSG[TRASH_FAILED]="Failed:"
+    MSG[TRASH_BACKEND]="Trash backend:"
+    MSG[DONE]="Done."
+    MSG[SRC_AI]="AI"
+    MSG[SRC_HEURISTIC]="name match"
+    MSG[SRC_AI_EXTRA]="found by AI"
+    MSG[CONF_HIGH]="high"
+    MSG[CONF_MEDIUM]="medium"
+    MSG[CONF_LOW]="low"
 fi
 
 # --- 3. 参数解析 ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --help|-h)
-            SHOW_HELP=true
-            shift
-            ;;
-        *)
-            QUERY_ARGS+=("$1")
-            shift
-            ;;
+        --help|-h) SHOW_HELP=true; shift ;;
+        --clean) CLEAN_MODE="yes"; shift ;;
+        --no-clean) CLEAN_MODE="no"; shift ;;
+        --scan) SCAN_ONLY=true; CLEAN_MODE="yes"; shift ;;
+        --rm) USE_RM=true; shift ;;
+        --ai)
+            [[ -n "${2:-}" ]] || { echo "Error: --ai requires <provider[:model]>." >&2; exit 1; }
+            AI_SPEC="$2"; shift 2 ;;
+        --ai-model)
+            [[ -n "${2:-}" ]] || { echo "Error: --ai-model requires a model value." >&2; exit 1; }
+            AI_MODEL_OVERRIDE="$2"; shift 2 ;;
+        *) QUERY_ARGS+=("$1"); shift ;;
     esac
 done
 
@@ -132,6 +228,12 @@ Usage: ${0##*/} [options] [query]
 
 ${MSG[OPTS]}
 ${MSG[OPT_HELP]}
+${MSG[OPT_CLEAN]}
+${MSG[OPT_NO_CLEAN]}
+${MSG[OPT_SCAN]}
+${MSG[OPT_RM]}
+${MSG[OPT_AI]}
+${MSG[OPT_AI_MODEL]}
 
 Description:
   ${MSG[DESC]}
@@ -140,25 +242,482 @@ ${MSG[FEAT]}
   ${MSG[FEAT_1]}
   ${MSG[FEAT_2]}
   ${MSG[FEAT_3]}
+  ${MSG[FEAT_4]}
 
 ${MSG[EX]}
   ${0##*/} firefox        # 搜索并卸载 'firefox' (无缝跨越两端)
+  ${0##*/} --scan qq      # 只看看 qq 在家目录留了什么
   ${0##*/}                # 列出所有已安装的包
 EOF
     exit 0
 fi
 
 # --- 6. 文件安全设置 ---
-TMP_DIR=$(mktemp -d -t unified_pacr.XXXXXX)
+TMP_DIR=$(mktemp -d -t shorin-pacr.XXXXXX)
 TARGET_FILE="${TMP_DIR}/target"
+CLEAN_FLAG="${TMP_DIR}/clean-requested"
 
 cleanup() {
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM
 
+# ==============================================================================
+# 残留检测
+# ==============================================================================
+
+# 永不列出、永不删除的家目录路径（相对 $HOME，支持 glob 前缀匹配）
+DENYLIST=(
+    .ssh .gnupg .pki .password-store .aws .azure .kube .docker .netrc
+    .bashrc .bash_profile .bash_logout .bash_history .zshrc .zsh_history .zprofile .zshenv .profile
+    .xinitrc .xprofile .Xauthority .ICEauthority .xsession-errors .gitconfig .gtkrc-2.0
+    .config/user-dirs.dirs .config/user-dirs.locale .config/mimeapps.list .config/dconf .config/fontconfig
+    .config/gtk-3.0 .config/gtk-4.0 .config/qt5ct .config/qt6ct .config/Kvantum .config/systemd .config/environment.d
+    .config/pulse .config/pipewire .config/wireplumber .config/dbus-1 .config/shorin-pac .config/fish .config/nvim
+    .cache/fontconfig .cache/mesa_shader_cache .cache/mesa_shader_cache_db .cache/radv_builtin_shaders .cache/thumbnails
+    .cache/paru .cache/yay .cache/pacman .cache/shorin-pac .cache/pip .cache/go-build .cache/cargo
+    .local/share/Trash .local/share/keyrings .local/share/flatpak .local/share/mime .local/share/icons .local/share/fonts
+    .local/share/themes .local/share/applications .local/share/systemd .local/share/gvfs-metadata .local/share/pacman
+    .local/state/wireplumber .local/bin .local/lib .themes .icons .fonts .var/app .var .local .config .cache .miyu
+    Desktop Documents Downloads Music Pictures Videos Public Templates
+)
+
+# 通用词：不能作为匹配关键词
+GENERIC_TOKENS=" linux arch tool tools client app apps desktop the and for with gnu gtk qt git bin lib libs x86 wine proton official unofficial free open source software program launcher manager viewer player editor plugin plugins theme themes icon icons font fonts data config cache share local state common core base extra community utils util python python3 nodejs node java rust "
+
+is_denied() {
+    # is_denied <绝对路径>：在黑名单内或不在家目录内 → 0
+    local path="$1" rel entry
+    case "$path" in
+        "$HOME"/*) rel="${path#"$HOME"/}" ;;
+        *) return 0 ;;
+    esac
+    [[ -n "$rel" ]] || return 0
+    for entry in "${DENYLIST[@]}"; do
+        if [[ "$rel" == "$entry" || "$rel" == "$entry"/* ]]; then
+            # 黑名单目录本身与其内部都拒绝，除了几个允许“内部单个文件”的共享目录
+            case "$entry" in
+                .local/share/applications|.config|.cache|.local|.var|.var/app|Documents|Downloads|Music|Pictures|Videos|Desktop)
+                    [[ "$rel" == "$entry" ]] && return 0
+                    ;;
+                *) return 0 ;;
+            esac
+        fi
+    done
+    return 1
+}
+
+add_token() {
+    # add_token <词>：规范化后加入 TOKENS（去重、去通用词、长度 ≥ 3）
+    local t
+    t=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '"' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [[ ${#t} -ge 2 ]] || return 0
+    [[ "$GENERIC_TOKENS" != *" $t "* ]] || return 0
+    [[ "$t" =~ ^[a-z0-9][a-z0-9._+-]*$ ]] || return 0
+    local existing
+    for existing in "${TOKENS[@]}"; do
+        [[ "$existing" != "$t" ]] || return 0
+    done
+    TOKENS+=("$t")
+}
+
+add_name_tokens() {
+    # 一个名字派生出多个关键词：整体、去后缀、按分隔符拆分
+    local name="$1" base part
+    add_token "$name"
+    base=$(printf '%s' "$name" | sed -E 's/-(git|bin|appimage|electron|wayland|qt|gtk|nightly|beta|dev|stable|desktop|app|cli|gui)$//; s/^linux//')
+    add_token "$base"
+    for part in $(printf '%s' "$name" | tr '._-' '   '); do
+        add_token "$part"
+    done
+}
+
+collect_pacman_meta() {
+    # collect_pacman_meta <pkg>：追加一条 package JSON 到 $PKG_META_FILE，并累积 TOKENS
+    local pkg="$1" desc url line bins=() desktops=() dname wm file
+    # 注意：值里可能含冒号（URL），只按第一个冒号切
+    desc=$(pacman -Qi "$pkg" 2>/dev/null | awk '/^(Description|描述)/ { sub(/^[^:]*:[ \t]*/, ""); print; exit }')
+    url=$(pacman -Qi "$pkg" 2>/dev/null | awk '/^(URL|网址)/ { sub(/^[^:]*:[ \t]*/, ""); print; exit }')
+    add_name_tokens "$pkg"
+    while IFS= read -r line; do
+        case "$line" in
+            /usr/bin/*)
+                [[ "$line" == */ ]] && continue
+                bins+=("$(basename "$line")")
+                add_name_tokens "$(basename "$line")"
+                ;;
+            /usr/share/applications/*.desktop)
+                file="$line"
+                dname=$(grep -m1 -E '^Name=' "$file" 2>/dev/null | cut -d= -f2- || true)
+                wm=$(grep -m1 -E '^StartupWMClass=' "$file" 2>/dev/null | cut -d= -f2- || true)
+                desktops+=("$(jq -cn --arg f "$(basename "$file")" --arg n "$dname" --arg w "$wm" '{file:$f, name:$n, wm_class:$w}')")
+                add_name_tokens "$(basename "$file" .desktop)"
+                [[ -z "$dname" ]] || add_name_tokens "$dname"
+                [[ -z "$wm" ]] || add_name_tokens "$wm"
+                ;;
+        esac
+    done < <(pacman -Qlq "$pkg" 2>/dev/null || true)
+    # 上游 URL：二级域名与路径段（github.com/foo/bar → foo、bar）
+    if [[ -n "$url" ]]; then
+        local host path seg
+        host=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://##; s#[/:?].*##; s#^www\.##')
+        path=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://[^/]+##')
+        case "$host" in
+            github.com|gitlab.com|codeberg.org|sourceforge.net|gitee.com|bitbucket.org|*.github.io|*.gitlab.io) ;;
+            *)
+                # 取可注册域名的二级标签：im.qq.com → qq；foo.co.uk → foo
+                local -a labels=()
+                IFS='.' read -r -a labels <<< "$host"
+                if (( ${#labels[@]} >= 2 )); then
+                    local sld="${labels[$(( ${#labels[@]} - 2 ))]}"
+                    case "$sld" in
+                        co|com|org|net|ac|edu|gov) (( ${#labels[@]} >= 3 )) && sld="${labels[$(( ${#labels[@]} - 3 ))]}" ;;
+                    esac
+                    add_token "$sld"
+                fi
+                ;;
+        esac
+        for seg in $(printf '%s' "$path" | tr '/' ' '); do add_name_tokens "$seg"; done
+    fi
+    # 描述里的专有名词（首字母大写、≥4 字母）
+    for seg in $(printf '%s' "$desc" | tr -c 'A-Za-z0-9' ' '); do
+        [[ "$seg" =~ ^[A-Z][A-Za-z0-9]{3,}$ ]] && add_token "$seg"
+    done
+    jq -cn --arg name "$pkg" --arg desc "$desc" --arg url "$url" \
+        --argjson bins "$(printf '%s\n' "${bins[@]:-}" | grep -v '^$' | jq -R . | jq -s .)" \
+        --argjson desktops "$(printf '%s\n' "${desktops[@]:-}" | grep -v '^$' | jq -s .)" \
+        '{name:$name, kind:"pacman", description:$desc, url:$url, binaries:$bins, desktop:$desktops}' >> "$PKG_META_FILE"
+}
+
+collect_flatpak_meta() {
+    local appid="$1" name part
+    name=$(flatpak info "$appid" 2>/dev/null | awk '/^(Name|名称)/ { sub(/^[^:]*:[ \t]*/, ""); print; exit }' || true)
+    add_token "$appid"
+    for part in $(printf '%s' "$appid" | tr '.' ' '); do
+        case "$part" in com|org|io|net|de|fr|uk|cn|app|github|gitlab|codeberg|sourceforge) ;; *) add_name_tokens "$part" ;; esac
+    done
+    [[ -z "$name" ]] || add_name_tokens "$name"
+    jq -cn --arg name "$appid" --arg desc "$name" \
+        '{name:$name, kind:"flatpak", description:$desc, url:"", binaries:[], desktop:[], data_dir:("~/.var/app/" + $name)}' >> "$PKG_META_FILE"
+}
+
+path_matches_tokens() {
+    # path_matches_tokens <路径> → 打印匹配到的关键词（空格分隔）；无匹配返回 1
+    local base t matched=""
+    base=$(basename "$1" | tr '[:upper:]' '[:lower:]')
+    base="${base%.desktop}"
+    for t in "${TOKENS[@]}"; do
+        if [[ "$base" == "$t" ]]; then
+            matched="${matched:+$matched }$t"
+        elif (( ${#t} >= 3 )) && { [[ "$base" == *"$t"* ]] || { (( ${#base} >= 4 )) && [[ "$t" == *"$base"* ]]; }; }; then
+            # 短关键词（2 字符）只做整名匹配，避免 "qq" 命中一堆无关目录
+            matched="${matched:+$matched }$t"
+        fi
+    done
+    [[ -n "$matched" ]] || return 1
+    printf '%s' "$matched"
+}
+
+emit_candidate() {
+    # emit_candidate <路径> <location> <matched tokens>：写一行 candidate JSON（去重、黑名单、存在性）
+    local path="$1" loc="$2" matched="$3" kind bytes mtime
+    [[ -e "$path" ]] || return 0
+    is_denied "$path" && return 0
+    grep -qxF -- "$path" "$SEEN_FILE" 2>/dev/null && return 0
+    printf '%s\n' "$path" >> "$SEEN_FILE"
+    if [[ -d "$path" ]]; then kind="dir"; else kind="file"; fi
+    bytes=$(du -sb -- "$path" 2>/dev/null | cut -f1 || echo 0)
+    mtime=$(stat -c '%y' -- "$path" 2>/dev/null | cut -d. -f1 || echo "")
+    jq -cn --arg p "$path" --arg k "$kind" --argjson b "${bytes:-0}" --arg m "$mtime" --arg l "$loc" \
+        --argjson t "$(printf '%s\n' $matched | jq -R . | jq -s .)" \
+        '{path:$p, kind:$k, bytes:$b, mtime:$m, location:$l, matched_tokens:$t}' >> "$CAND_FILE"
+}
+
+enumerate_candidates() {
+    # 标准位置按“每个应用一个条目”的粒度枚举；再对非隐藏目录做限深的关键词搜索
+    local root entry matched name
+    for root in .config .cache .local/share .local/state .var/app; do
+        [[ -d "$HOME/$root" ]] || continue
+        for entry in "$HOME/$root"/* "$HOME/$root"/.[!.]*; do
+            [[ -e "$entry" ]] || continue
+            if matched=$(path_matches_tokens "$entry"); then
+                emit_candidate "$entry" "$root" "$matched"
+            fi
+        done
+    done
+    # 共享目录里的单个文件
+    for root in .local/share/applications .config/autostart .local/share/icons/hicolor .local/share/pixmaps; do
+        [[ -d "$HOME/$root" ]] || continue
+        while IFS= read -r entry; do
+            if matched=$(path_matches_tokens "$entry"); then
+                emit_candidate "$entry" "$root" "$matched"
+            fi
+        done < <(find "$HOME/$root" -maxdepth 3 -type f 2>/dev/null)
+    done
+    # 根级点目录/点文件
+    for entry in "$HOME"/.[!.]*; do
+        [[ -e "$entry" ]] || continue
+        name=$(basename "$entry")
+        case "$name" in .config|.cache|.local|.var) continue ;; esac
+        if matched=$(path_matches_tokens "$entry"); then
+            emit_candidate "$entry" "home" "$matched"
+        fi
+    done
+    # 非隐藏目录（Documents、Games…）限深关键词搜索：偏门位置如 ~/Documents/Tencent Files
+    local -a find_args=()
+    local t
+    for t in "${TOKENS[@]}"; do
+        if (( ${#t} >= 3 )); then find_args+=(-o -iname "*${t}*"); else find_args+=(-o -iname "${t}"); fi
+    done
+    [[ ${#find_args[@]} -gt 0 ]] || return 0
+    while IFS= read -r entry; do
+        if matched=$(path_matches_tokens "$entry"); then
+            emit_candidate "$entry" "visible" "$matched"
+        fi
+    done < <(find "$HOME" -mindepth 2 -maxdepth "$MAX_TOKEN_SEARCH_DEPTH" -not -path "$HOME/.*" \
+                \( -false "${find_args[@]}" \) 2>/dev/null | head -n 200)
+}
+
+score_candidates() {
+    # 给候选打分并按分数排序，截断到 MAX_CANDIDATES；输出 NDJSON 到 $CAND_FILE
+    local sorted="${CAND_FILE}.sorted"
+    jq -c --argjson toks "$(printf '%s\n' "${TOKENS[@]}" | jq -R . | jq -s .)" '
+        . as $c
+        | ($c.path | split("/") | last | ascii_downcase | sub("\\.desktop$"; "")) as $base
+        | (if ($toks | index($base)) then 100 else 60 end) as $name_score
+        | (if ($c.location == ".config" or $c.location == ".local/share" or $c.location == ".var/app") then 20
+           elif ($c.location == ".cache" or $c.location == ".local/state") then 10
+           elif ($c.location == "home") then 5 else 0 end) as $loc_score
+        | . + {score: ($name_score + $loc_score)}
+    ' "$CAND_FILE" | jq -s -c 'sort_by(-.score) | .[]' | head -n "$MAX_CANDIDATES" > "$sorted"
+    mv -f "$sorted" "$CAND_FILE"
+}
+
+load_ai_lib() {
+    [[ -n "$AI_LIB" ]] || return 1
+    SHORIN_PAC_LOCALE="$ORIGINAL_LANG"
+    # shellcheck source=/dev/null
+    source "$AI_LIB"
+    ai_init || return 1
+    local spec="$AI_SPEC"
+    if [[ -z "$spec" && -n "$AI_MODEL_OVERRIDE" ]]; then
+        ai_resolve >/dev/null 2>&1 || return 1
+        spec="${AI_PROVIDER_ID}:${AI_MODEL_OVERRIDE}"
+    fi
+    ai_resolve "$spec" || return 1
+    AI_LOADED=true
+}
+
+LEFTOVER_JQ_CHECK='(.leftovers | type == "array")
+    and all(.leftovers[]; (.path | type == "string") and (.confidence | IN("high","medium","low")))'
+
+run_leftover_ai() {
+    # run_leftover_ai DOSSIER RESULT：调用 AI，结果 JSON 写到 RESULT
+    local dossier="$1" result="$2" sys="${TMP_DIR}/leftover.system"
+    {
+        cat "${AI_PROMPT_DIR}/leftover-scan.md"
+        if ai_backend_has_tools; then cat "${AI_PROMPT_DIR}/leftover-scan-tools.md"; fi
+        printf '\nLanguage: write `reason` and `notes` in %s.\n' "$(ai_lang_name)"
+    } > "$sys"
+    echo -e "\033[90m> AI: $(ai_describe_selection)\033[0m"
+    ai_json_complete "$sys" "$dossier" "$result" "$HOME" "$LEFTOVER_JQ_CHECK"
+}
+
+build_final_list() {
+    # 合并 AI 结果与候选：输出 NDJSON {path, confidence, reason, source, bytes} 到 $FINAL_FILE
+    # AI 给的路径必须：存在、在家目录内、不在黑名单、不是别的条目的子路径重复
+    local result="$1" line path conf reason bytes src
+    : > "$FINAL_FILE"
+    if [[ -s "$result" ]]; then
+        while IFS= read -r line; do
+            path=$(jq -r '.path' <<< "$line")
+            path="${path/#\~/$HOME}"
+            [[ "$path" == /* ]] || path="$HOME/$path"
+            path=$(realpath -m -- "$path" 2>/dev/null || printf '%s' "$path")
+            [[ -e "$path" && ! -L "$path" ]] || continue
+            is_denied "$path" && continue
+            conf=$(jq -r '.confidence' <<< "$line")
+            reason=$(jq -r '.reason // ""' <<< "$line" | tr -d '\n\t')
+            if grep -qxF -- "$path" "$SEEN_FILE" 2>/dev/null; then src="ai"; else src="ai_extra"; fi
+            bytes=$(du -sb -- "$path" 2>/dev/null | cut -f1 || echo 0)
+            jq -cn --arg p "$path" --arg c "$conf" --arg r "$reason" --arg s "$src" --argjson b "${bytes:-0}" \
+                '{path:$p, confidence:$c, reason:$r, source:$s, bytes:$b}' >> "$FINAL_FILE"
+        done < <(jq -c '.leftovers[]' "$result" 2>/dev/null)
+    fi
+    if [[ "$HEURISTIC_FALLBACK" == true ]]; then
+        # 无 AI：候选按名称匹配列出，完全同名算中置信度，其余低
+        jq -c 'if .score >= 110 then .confidence = "medium" else .confidence = "low" end
+               | {path:.path, confidence:.confidence, reason:("matched: " + (.matched_tokens | join(", "))), source:"heuristic", bytes:.bytes}' \
+            "$CAND_FILE" >> "$FINAL_FILE"
+    else
+        # 有 AI：AI 没提到但与包名完全同名的候选，仍以低置信度列出、不预选，由用户决定（AI 可能漏）
+        jq -c 'select(.score >= 100)
+               | {path:.path, confidence:"low", reason:("matched: " + (.matched_tokens | join(", "))), source:"heuristic", bytes:.bytes}' \
+            "$CAND_FILE" >> "$FINAL_FILE"
+    fi
+    # 去重 + 去掉被父目录覆盖的子项 + 按置信度排序
+    jq -s -c '
+        unique_by(.path)
+        | . as $all
+        | [ .[] | . as $e | select( any($all[]; .path != $e.path and ((.path + "/") as $p | $e.path | startswith($p))) | not ) ]
+        | sort_by((if .confidence == "high" then 0 elif .confidence == "medium" then 1 else 2 end), .path)
+        | .[]' "$FINAL_FILE" > "${FINAL_FILE}.tmp"
+    mv -f "${FINAL_FILE}.tmp" "$FINAL_FILE"
+}
+
+human_size() {
+    numfmt --to=iec --suffix=B "$1" 2>/dev/null || printf '%sB' "$1"
+}
+
+pick_leftovers() {
+    # fzf 勾选；输出选中的路径到 $PICK_FILE。高置信度项预选。
+    local rows preselect="" n=0 i conf label src_label color
+    : > "$PICK_FILE"
+    rows=$(while IFS= read -r line; do
+        n=$((n + 1))
+        conf=$(jq -r '.confidence' <<< "$line")
+        case "$conf" in
+            high) label="${MSG[CONF_HIGH]}"; color=$'\033[31m'; preselect="${preselect}+pos(${n})+select" ;;
+            medium) label="${MSG[CONF_MEDIUM]}"; color=$'\033[33m' ;;
+            *) label="${MSG[CONF_LOW]}"; color=$'\033[90m' ;;
+        esac
+        case "$(jq -r '.source' <<< "$line")" in
+            ai) src_label="${MSG[SRC_AI]}" ;;
+            ai_extra) src_label="${MSG[SRC_AI_EXTRA]}" ;;
+            *) src_label="${MSG[SRC_HEURISTIC]}" ;;
+        esac
+        printf '%s\t%s[%s]\033[0m %-6s %s  \033[90m%s · %s\033[0m\n' \
+            "$(jq -r '.path' <<< "$line")" "$color" "$label" "$(human_size "$(jq -r '.bytes' <<< "$line")")" \
+            "$(jq -r '.path' <<< "$line" | sed "s#^$HOME#~#")" "$src_label" "$(jq -r '.reason' <<< "$line")"
+    done < "$FINAL_FILE")
+    local bind="start:first"
+    [[ -z "$preselect" ]] || bind="start:${preselect#+}+first"
+    printf '%s\n' "$rows" | fzf --multi --ansi --delimiter='\t' --with-nth=2.. \
+        --height=70% --layout=reverse --border --tiebreak=index \
+        --header "${MSG[PICK_HEADER]}" --prompt "${MSG[PICK_PROMPT]}" \
+        --bind "$bind" \
+        --preview 'p=$(printf "%s" {1}); if [ -d "$p" ]; then ls -la --color=always "$p" | head -60; else file "$p"; head -c 2000 "$p"; fi' \
+        --preview-window=down:45%:wrap \
+        | cut -f1 > "$PICK_FILE" || true
+}
+
+trash_backend() {
+    if [[ "$USE_RM" == true ]]; then printf 'rm'
+    elif command -v gio >/dev/null 2>&1; then printf 'gio'
+    elif command -v trash-put >/dev/null 2>&1; then printf 'trash-put'
+    else printf 'xdg'; fi
+}
+
+trash_manual() {
+    # 手写 FreeDesktop Trash 规范：~/.local/share/Trash/files + info/*.trashinfo
+    local path="$1" trash="${XDG_DATA_HOME:-$HOME/.local/share}/Trash" name target i=0
+    mkdir -p "$trash/files" "$trash/info"
+    name=$(basename "$path")
+    target="$trash/files/$name"
+    while [[ -e "$target" || -e "$trash/info/$(basename "$target").trashinfo" ]]; do
+        i=$((i + 1)); target="$trash/files/${name}.${i}"
+    done
+    printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' "$(printf '%s' "$path" | jq -Rr '@uri' | sed 's#%2F#/#g')" "$(date +%Y-%m-%dT%H:%M:%S)" \
+        > "$trash/info/$(basename "$target").trashinfo"
+    mv -- "$path" "$target"
+}
+
+trash_path() {
+    local path="$1"
+    case "$(trash_backend)" in
+        rm) rm -rf -- "$path" ;;
+        gio) gio trash -- "$path" ;;
+        trash-put) trash-put -- "$path" ;;
+        xdg) trash_manual "$path" ;;
+    esac
+}
+
+process_leftovers() {
+    # process_leftovers：对 $PICK_FILE 里的路径逐个入回收站；再次校验边界
+    local path ok=0 fail=0 backend
+    backend=$(trash_backend)
+    echo -e "\n\033[36m${MSG[TRASHING]}\033[0m \033[90m${MSG[TRASH_BACKEND]} ${backend}\033[0m"
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        if [[ ! -e "$path" || -L "$path" ]] || is_denied "$path"; then
+            echo -e "  \033[31m${MSG[TRASH_FAILED]}\033[0m $path"; fail=$((fail + 1)); continue
+        fi
+        if trash_path "$path"; then
+            if [[ "$backend" == rm ]]; then echo -e "  \033[33m${MSG[DELETED]}\033[0m $path"; else echo -e "  \033[32m${MSG[TRASHED]}\033[0m $path"; fi
+            ok=$((ok + 1))
+        else
+            echo -e "  \033[31m${MSG[TRASH_FAILED]}\033[0m $path"; fail=$((fail + 1))
+        fi
+    done < "$PICK_FILE"
+    echo -e "\033[36m${MSG[DONE]}\033[0m ($ok ok, $fail failed)"
+}
+
+leftover_scan() {
+    # leftover_scan：主流程。输入 PAC_PKGS / FPK_PKGS；输出 PICK_FILE（选中的路径）
+    PKG_META_FILE="${TMP_DIR}/packages.ndjson"
+    CAND_FILE="${TMP_DIR}/candidates.ndjson"
+    SEEN_FILE="${TMP_DIR}/seen"
+    FINAL_FILE="${TMP_DIR}/final.ndjson"
+    PICK_FILE="${TMP_DIR}/picked"
+    DOSSIER="${TMP_DIR}/leftover.dossier"
+    RESULT="${TMP_DIR}/leftover.json"
+    : > "$PKG_META_FILE"; : > "$CAND_FILE"; : > "$SEEN_FILE"; : > "$PICK_FILE"
+    TOKENS=()
+    HEURISTIC_FALLBACK=false
+
+    echo -e "\n\033[36m${MSG[COLLECTING]}\033[0m"
+    local p
+    for p in "${PAC_PKGS[@]}"; do collect_pacman_meta "$p"; done
+    for p in "${FPK_PKGS[@]}"; do collect_flatpak_meta "$p"; done
+    echo -e "\033[90m${MSG[TOKENS]} ${TOKENS[*]:-}\033[0m"
+    enumerate_candidates
+    # Flatpak 的数据目录是确定的，直接补进候选
+    for p in "${FPK_PKGS[@]}"; do emit_candidate "$HOME/.var/app/$p" ".var/app" "$p"; done
+    if [[ -s "$CAND_FILE" ]]; then score_candidates; fi
+    printf "\033[90m${MSG[CANDIDATES]}\033[0m\n" "$(grep -c . "$CAND_FILE" || true)"
+
+    if [[ "$AI_LOADED" == true ]]; then
+        jq -n --arg home "$HOME" \
+            --slurpfile pkgs "$PKG_META_FILE" \
+            --slurpfile cands "$CAND_FILE" \
+            '{schema:"shorin_pac_leftover_evidence_v1", home:$home, packages:$pkgs, candidates:$cands}' > "$DOSSIER"
+        if ! run_leftover_ai "$DOSSIER" "$RESULT"; then
+            echo -e "\033[33m${MSG[AI_FAILED]}\033[0m" >&2
+            HEURISTIC_FALLBACK=true
+            : > "$RESULT"
+        fi
+    else
+        HEURISTIC_FALLBACK=true
+        : > "$RESULT"
+    fi
+
+    build_final_list "$RESULT"
+    if [[ -s "$RESULT" ]]; then
+        local notes
+        notes=$(jq -r '.notes[]? | select(type == "string" and length > 0) | "  - " + .' "$RESULT" 2>/dev/null || true)
+        if [[ -n "$notes" ]]; then
+            echo -e "\033[36m${MSG[AI_NOTES]}\033[0m"
+            printf '%s\n' "$notes"
+        fi
+    fi
+    if [[ ! -s "$FINAL_FILE" ]]; then
+        echo -e "\033[32m${MSG[NO_CANDIDATES]}\033[0m"
+        return 0
+    fi
+    pick_leftovers
+    if [[ ! -s "$PICK_FILE" ]]; then
+        echo -e "\033[33m${MSG[PICK_NONE]}\033[0m"
+        return 0
+    fi
+    if [[ "$USE_RM" == true ]]; then
+        printf "\033[33m${MSG[PICKED_RM]}\033[0m\n" "$(grep -c . "$PICK_FILE")"
+    else
+        printf "\033[36m${MSG[PICKED]}\033[0m\n" "$(grep -c . "$PICK_FILE")"
+    fi
+    sed "s#^$HOME#~#; s/^/  /" "$PICK_FILE"
+}
+
 # --- 7. 交互式 FZF 渲染与智能预览 ---
-# 这里 $3 能精准提取包名，不再被颜色符干扰
 PREVIEW_CMD="
 line={}
 if [[ \"\$line\" == PKG:* ]]; then
@@ -179,13 +738,13 @@ if [ "$HAS_FLATPAK" = true ]; then
 fi
 
 set +e
-# 【修复点3】去掉了 --nth=3.. 解锁全部字段搜索，支持搜索软件名、仓库名(aur/flathub) 和 版本号
 fzf --multi --ansi \
     --preview "$PREVIEW_CMD" \
     --preview-window=down:55%:wrap \
     --height=95% --layout=reverse --border \
     --bind "alt-j:last,alt-k:first" \
     --bind "ctrl-r:reload(\"$SCRIPT_PATH\" --generate-data)" \
+    --bind "alt-c:execute-silent(touch \"$CLEAN_FLAG\")+accept" \
     --tiebreak=index \
     --with-nth=2.. \
     --header "$FZF_HEADER" \
@@ -195,36 +754,94 @@ fzf --multi --ansi \
 FZF_EXIT=$?
 set -e
 
-# --- 8. 执行卸载逻辑 (分发处理) ---
-if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
-    mapfile -t SELECTED_LINES < "$TARGET_FILE"
-    PAC_PKGS=()
-    FPK_PKGS=()
-    
-    # 拆分选中的项目
-    for line in "${SELECTED_LINES[@]}"; do
-        if [[ "$line" == PKG:* ]]; then
-            pkg=$(echo "$line" | awk '{print $3}')
-            [[ -n "$pkg" ]] && PAC_PKGS+=("$pkg")
-        elif [[ "$line" == FLTK:* ]]; then
-            appid=$(echo "$line" | awk '{print $NF}')
-            [[ -n "$appid" ]] && FPK_PKGS+=("$appid")
-        fi
-    done
-    
-    # 执行 Pacman/AUR 卸载
-    if [[ ${#PAC_PKGS[@]} -gt 0 ]]; then
-        echo -e "\n\033[34m${MSG[REMOVING_PAC]}\033[0m"
-        echo "${PAC_PKGS[*]}"
-        echo "----------------------------------------"
-        "$AUR_HELPER" -Rns "${PAC_PKGS[@]}"
-    fi
+[[ $FZF_EXIT -eq 0 && -s "$TARGET_FILE" ]] || exit 0
+[[ ! -e "$CLEAN_FLAG" ]] || CLEAN_MODE="yes"
 
-    # 执行 Flatpak 卸载
-    if [[ ${#FPK_PKGS[@]} -gt 0 ]]; then
-        echo -e "\n\033[36m${MSG[REMOVING_FPK]}\033[0m"
-        echo "${FPK_PKGS[*]}"
-        echo "----------------------------------------"
-        flatpak uninstall "${FPK_PKGS[@]}"
+# --- 8. 拆分选中的项目 ---
+mapfile -t SELECTED_LINES < "$TARGET_FILE"
+PAC_PKGS=()
+FPK_PKGS=()
+for line in "${SELECTED_LINES[@]}"; do
+    if [[ "$line" == PKG:* ]]; then
+        pkg=$(echo "$line" | awk '{print $3}')
+        [[ -n "$pkg" ]] && PAC_PKGS+=("$pkg")
+    elif [[ "$line" == FLTK:* ]]; then
+        appid=$(echo "$line" | awk '{print $NF}')
+        [[ -n "$appid" ]] && FPK_PKGS+=("$appid")
+    fi
+done
+[[ ${#PAC_PKGS[@]} -gt 0 || ${#FPK_PKGS[@]} -gt 0 ]] || exit 0
+ALL_NAMES="${PAC_PKGS[*]:-} ${FPK_PKGS[*]:-}"
+
+# --- 9. 残留检测（卸载之前） ---
+AI_LOADED=false
+DO_CLEAN=false
+if [[ "$CLEAN_MODE" != "no" ]]; then
+    load_ai_lib || true
+    if [[ "$CLEAN_MODE" == "yes" ]]; then
+        DO_CLEAN=true
+        [[ "$AI_LOADED" == true ]] || echo -e "\033[33m${MSG[AI_UNAVAILABLE]}\033[0m" >&2
+    else
+        while true; do
+            echo -e "\n\033[35m╭─ ${MSG[CLEAN_ASK_TITLE]}\033[0m"
+            printf "\033[35m│\033[0m ${MSG[CLEAN_ASK_BODY]}\n" "${ALL_NAMES# }"
+            echo -e "\033[35m│\033[0m \033[90m${MSG[CLEAN_ASK_HINT]}\033[0m"
+            if [[ "$AI_LOADED" == true ]]; then
+                printf "\033[35m│\033[0m \033[90m${MSG[CLEAN_ASK_MODEL]}\033[0m\n" "$(ai_describe_selection)"
+            else
+                echo -e "\033[35m│\033[0m \033[33m${MSG[AI_UNAVAILABLE]}\033[0m"
+            fi
+            printf "\033[35m╰─\033[0m ${MSG[CLEAN_ASK_PROMPT]}"
+            read -r answer || answer="n"
+            case "$answer" in
+                y|Y|yes|YES) DO_CLEAN=true; break ;;
+                m|M) if [[ "$AI_LOADED" == true ]]; then ai_select_interactive || true; AI_SPEC=""; AI_MODEL_OVERRIDE=""; fi ;;
+                *) break ;;
+            esac
+        done
     fi
 fi
+
+if [[ "$DO_CLEAN" == true ]]; then
+    leftover_scan
+fi
+
+if [[ "$SCAN_ONLY" == true ]]; then
+    echo -e "\n\033[36m${MSG[SCAN_DONE]}\033[0m"
+    exit 0
+fi
+
+# --- 10. 确认并执行卸载 ---
+if [[ "$DO_CLEAN" == true ]]; then
+    printf "\n${MSG[CONFIRM_REMOVE]}"
+    read -r answer || answer="n"
+    case "${answer:-Y}" in
+        y|Y|yes|YES) ;;
+        *) echo "${MSG[CANCELLED]}"; exit 0 ;;
+    esac
+fi
+
+REMOVE_OK=true
+if [[ ${#PAC_PKGS[@]} -gt 0 ]]; then
+    echo -e "\n\033[34m${MSG[REMOVING_PAC]}\033[0m"
+    echo "${PAC_PKGS[*]}"
+    echo "----------------------------------------"
+    LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" -Rns "${PAC_PKGS[@]}" || REMOVE_OK=false
+fi
+if [[ ${#FPK_PKGS[@]} -gt 0 ]]; then
+    echo -e "\n\033[36m${MSG[REMOVING_FPK]}\033[0m"
+    echo "${FPK_PKGS[*]}"
+    echo "----------------------------------------"
+    LC_ALL="$ORIGINAL_LANG" flatpak uninstall "${FPK_PKGS[@]}" || REMOVE_OK=false
+fi
+
+# --- 11. 卸载成功后处理残留 ---
+if [[ "$DO_CLEAN" == true && -s "${PICK_FILE:-/dev/null}" ]]; then
+    if [[ "$REMOVE_OK" == true ]]; then
+        process_leftovers
+    else
+        echo -e "\033[33m${MSG[REMOVE_FAILED]}\033[0m" >&2
+        exit 1
+    fi
+fi
+[[ "$REMOVE_OK" == true ]] || exit 1

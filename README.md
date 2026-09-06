@@ -20,9 +20,19 @@ shorin-pac config           # 选择 AI 供应商和模型（可选）
 |---|---|
 | `pac [关键词]` | 模糊搜索并安装 pacman / AUR 包，AUR 包安装前可做 AI 安全审查 |
 | `pac --check [关键词]` | 只审查 AUR 包，不安装 |
-| `pacr [关键词]` | 模糊搜索并卸载 pacman / AUR / Flatpak 包，可用 AI 检测家目录残留 |
+| `pacr [关键词]` | 模糊搜索并卸载 pacman / AUR / Flatpak 包；回车后询问是否用 AI 检测家目录残留，fzf 里按 Alt+C 直接“卸载并清残留” |
+| `pacr --scan [关键词]` | 只检测并列出残留，不卸载不删除 |
+| `pacr --clean` / `--no-clean` / `--rm` | 不询问直接检测 / 跳过检测 / 残留直接删除而不是进回收站 |
 | `shorin-pac config` | 配置 AI 供应商和模型（菜单）；也有 `select` / `show` / `set` / `add` / `remove` / `test` 子命令 |
 | `shorin-pac link` / `unlink` | 管理 `~/.local/bin` 中的 `pac` / `pacr` 链接 |
+
+## 残留清理是怎么做的 / How leftover cleanup works
+
+1. 选好要卸载的包后，pacr 先（在卸载之前）收集包的描述、上游 URL、二进制名、desktop 文件，派生出匹配关键词。
+2. 在家目录按“每个应用一个条目”的粒度枚举候选：`~/.config`、`~/.cache`、`~/.local/share`、`~/.local/state`、`~/.var/app`、根级点目录，外加对 `Documents` 等可见目录的限深关键词搜索（能找到 `~/Documents/Tencent Files` 这类偏门位置）。
+3. 候选连同包信息交给 AI 判断置信度；本机 CLI 后端还允许 AI 用只读命令自己再找找。AI 没提到但与包名完全同名的候选也会以低置信度列出，由你决定。
+4. fzf 里勾选（高置信度预选）→ 确认卸载 → 卸载 → 卸载成功后才把勾选项移入回收站（`gio trash` → `trash-put` → 手写 FreeDesktop 规范，都没有就直接删）。
+5. 硬边界：只动家目录；`.ssh`、`.gnupg`、密钥环、shell rc、`Documents` 这类顶层目录本身、共享的 mime/icons/fonts 等永远不会出现在清单里，AI 给出的路径也要过同一道校验。
 
 ## AI 供应商 / AI providers
 
