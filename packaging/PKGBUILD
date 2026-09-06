@@ -1,0 +1,67 @@
+# Maintainer: Shorin <2433516202@qq.com>
+
+pkgname=shorin-pac-git
+_pkgname=shorin-pac
+pkgver=r26.0000000
+pkgrel=1
+pkgdesc="Simple fzf-based TUI to install/remove pacman, AUR and Flatpak packages on Arch, with AI-assisted AUR review and leftover cleanup"
+arch=('any')
+url="https://github.com/SHORiN-KiWATA/shorin-pac"
+license=('GPL-3.0-or-later')
+depends=('bash' 'curl' 'fzf' 'jq' 'pacman')
+makedepends=('git')
+install="${_pkgname}.install"
+optdepends=(
+    'paru: preferred AUR helper'
+    'yay: fallback AUR helper (pac can install it for you)'
+    'flatpak: list and remove Flatpak apps in pacr'
+    'trash-cli: send leftovers to the trash instead of deleting'
+    'opencode: local AI backend for AUR review'
+    'claude-code: local AI backend for AUR review'
+)
+provides=("${_pkgname}")
+conflicts=("${_pkgname}")
+
+source=("git+https://github.com/SHORiN-KiWATA/shorin-pac.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "${_pkgname}"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+package() {
+    cd "${_pkgname}"
+
+    # 子命令脚本进私有库目录；调度器进 /usr/bin。
+    install -dm755 "${pkgdir}/usr/lib/${_pkgname}"
+    local script
+    for script in bin/*; do
+        [[ "$(basename "$script")" == "shorin-pac" ]] && continue
+        install -Dm755 "$script" "${pkgdir}/usr/lib/${_pkgname}/$(basename "$script")"
+    done
+    install -Dm755 bin/shorin-pac "${pkgdir}/usr/bin/shorin-pac"
+
+    # 共享库与提示词（后续版本加入；目录不存在时跳过）。
+    if [[ -d lib ]]; then
+        install -dm755 "${pkgdir}/usr/lib/${_pkgname}/lib"
+        find lib -type f -exec install -Dm644 {} "${pkgdir}/usr/lib/${_pkgname}/{}" \;
+    fi
+    if [[ -d prompts ]]; then
+        install -dm755 "${pkgdir}/usr/lib/${_pkgname}/prompts"
+        find prompts -type f -exec install -Dm644 {} "${pkgdir}/usr/lib/${_pkgname}/{}" \;
+    fi
+
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+    # fish 补全
+    install -dm755 "${pkgdir}/usr/share/fish/vendor_completions.d"
+    cat << 'EOF' > "${pkgdir}/usr/share/fish/vendor_completions.d/shorin-pac.fish"
+complete -c shorin-pac -f
+complete -c shorin-pac -n '__fish_use_subcommand' -a 'pac' -d 'Install packages (pacman/AUR/Flatpak TUI)'
+complete -c shorin-pac -n '__fish_use_subcommand' -a 'pacr' -d 'Remove packages TUI'
+complete -c shorin-pac -n '__fish_use_subcommand' -a 'config' -d 'Configure AI provider and model'
+complete -c shorin-pac -n '__fish_use_subcommand' -a 'link' -d 'Symlink pac/pacr into ~/.local/bin'
+complete -c shorin-pac -n '__fish_use_subcommand' -a 'unlink' -d 'Remove pac/pacr symlinks'
+EOF
+}

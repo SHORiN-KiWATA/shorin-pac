@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# 描述： shorin-pac 主调度器
+# Description: shorin-pac main dispatcher
+# ==============================================================================
+# 基于 fzf 的简易 TUI：在 Arch 上安装/卸载 pacman、AUR、Flatpak 软件，
+# 支持 AI 审核 AUR、AI 清理软件残留。
+#
+# 子命令由 LIB_DIR 下的可执行脚本动态发现；描述取脚本第 2/3 行的
+# “# 描述：” / “# Description:” 注释，和 shorin-contrib 的约定一致。
+# ==============================================================================
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# 已安装时脚本在 /usr/lib/shorin-pac；直接从源码仓库运行时脚本和本调度器同目录。
+if [[ -n "${SHORIN_PAC_LIB:-}" && -d "${SHORIN_PAC_LIB}" ]]; then
+    LIB_DIR="${SHORIN_PAC_LIB}"
+elif [[ -x "${SCRIPT_DIR}/pac" ]]; then
+    LIB_DIR="${SCRIPT_DIR}"
+else
+    LIB_DIR="/usr/lib/shorin-pac"
+fi
+
+# 只有这些命令会被 link 到 ~/.local/bin；调度器自身不链接。
+LINKABLE=(pac pacr)
+
+# --------------------- 语言检测 ---------------------
+MESSAGE_LOCALE="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
+if [[ "${MESSAGE_LOCALE,,}" == *zh* ]]; then
+    IS_CN=true
+else
+    IS_CN=false
+fi
+
+if $IS_CN; then
+    USAGE_STR="用法:"
+    DESC_STR="基于 fzf 的简易 TUI，在 Arch 上安装/卸载 pacman、AUR、Flatpak 软件，支持 AI 审核 AUR 与 AI 清理残留。"
+    AVAIL_STR="可用子命令:"
+    ENV_STR="环境管理:"
+    CONFIG_DESC="配置 AI 供应商与模型"
+    LINK_DESC="把 pac / pacr 链接到 ~/.local/bin，之后可直接输入 pac 使用"
+    UNLINK_DESC="移除 ~/.local/bin 中的 pac / pacr 链接"
+    LINK_START="开始生成本地快捷命令..."
+    LINK_DONE="链接部署完成！请确认 ~/.local/bin 已加入 PATH。"
+    LINK_ITEM="[User] 已链接:"
+    LINK_REPLACED="[User] 已替换失效链接:"
+    UNLINK_START="开始清理快捷命令..."
+    UNLINK_DONE="链接清理完成！"
+    UNLINK_ITEM="[User] 已移除:"
+    UNLINK_SKIP="[User] 跳过（不是 shorin-pac 的链接）:"
+    UNKNOWN_CMD="未知子命令"
+    SUB_PLACEHOLDER="<子命令>"
+    OPT_PLACEHOLDER="[选项]"
+    HINT_STR="提示: 运行 shorin-pac link 后可直接使用 pac 与 pacr。"
+else
+    USAGE_STR="Usage:"
+    DESC_STR="Simple fzf-based TUI to install/remove pacman, AUR and Flatpak packages on Arch, with AI-assisted AUR review and leftover cleanup."
+    AVAIL_STR="Available subcommands:"
+    ENV_STR="Environment management:"
+    CONFIG_DESC="Configure the AI provider and model"
+    LINK_DESC="Symlink pac / pacr into ~/.local/bin so you can run them directly"
+    UNLINK_DESC="Remove the pac / pacr symlinks from ~/.local/bin"
+    LINK_START="Creating local symlinks..."
+    LINK_DONE="Symlink deployment complete! Make sure ~/.local/bin is in your PATH."
+    LINK_ITEM="[User] Linked:"
+    LINK_REPLACED="[User] Replaced dangling link:"
+    UNLINK_START="Cleaning up symlinks..."
+    UNLINK_DONE="Symlink cleanup complete!"
+    UNLINK_ITEM="[User] Removed:"
+    UNLINK_SKIP="[User] Skipped (not a shorin-pac link):"
+    UNKNOWN_CMD="unknown subcommand"
+    SUB_PLACEHOLDER="<subcommand>"
+    OPT_PLACEHOLDER="[options]"
+    HINT_STR="Hint: run 'shorin-pac link' once, then use pac and pacr directly."
+fi
+
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+script_desc() {
+    local script="$1" desc
+    if $IS_CN; then
+        desc=$(sed -n '2p' "$script" | sed -E 's/^#[[:space:]]*描述：[[:space:]]*//')
+    else
+        desc=$(sed -n '3p' "$script" | sed -E 's/^#[[:space:]]*Description:[[:space:]]*//')
+    fi
+    [[ -n "$desc" ]] || desc="-"
+    printf '%s' "$desc"
+}
+
+# 供 shorin-contrib 的 `shorin` 调度器查询：每行 “名字<TAB>描述”，描述随当前语言。
+list_subcommands() {
+    local name
+    for name in "${LINKABLE[@]}"; do
+        [[ -x "${LIB_DIR}/${name}" ]] || continue
+        printf '%s\t%s\n' "$name" "$(script_desc "${LIB_DIR}/${name}")"
+    done
+    return 0
+}
+
+usage() {
+    echo -e "${USAGE_STR} ${BLUE}shorin-pac${NC} ${SUB_PLACEHOLDER} ${OPT_PLACEHOLDER}"
+    echo -e "\n${DESC_STR}"
+    echo -e "\n${AVAIL_STR}"
+    local name
+    for name in "${LINKABLE[@]}"; do
+        [[ -x "${LIB_DIR}/${name}" ]] || continue
+        printf "  ${BLUE}%-10s${NC} %s\n" "$name" "$(script_desc "${LIB_DIR}/${name}")"
+    done
+    echo -e "\n${ENV_STR}"
+    printf "  ${BLUE}%-10s${NC} %s\n" "config" "$CONFIG_DESC"
+    printf "  ${BLUE}%-10s${NC} %s\n" "link"   "$LINK_DESC"
+    printf "  ${BLUE}%-10s${NC} %s\n" "unlink" "$UNLINK_DESC"
+    echo -e "\n${HINT_STR}"
+}
+
+do_link() {
+    local bin_dir="$HOME/.local/bin" name target link
+    mkdir -p "$bin_dir"
+    echo "$LINK_START"
+    for name in "${LINKABLE[@]}"; do
+        target="${LIB_DIR}/${name}"
+        [[ -x "$target" ]] || continue
+        link="${bin_dir}/${name}"
+        # 老版本 shorin-contrib 留下的悬空链接（指向已删除的脚本）会遮住新命令，直接替换。
+        if [[ -L "$link" && ! -e "$link" ]]; then
+            ln -sf "$target" "$link"
+            echo "  ${LINK_REPLACED} ~/.local/bin/${name}"
+            continue
+        fi
+        ln -sf "$target" "$link"
+        echo "  ${LINK_ITEM} ~/.local/bin/${name}"
+    done
+    echo -e "\n${LINK_DONE}"
+}
+
+do_unlink() {
+    local bin_dir="$HOME/.local/bin" name link resolved
+    echo "$UNLINK_START"
+    for name in "${LINKABLE[@]}"; do
+        link="${bin_dir}/${name}"
+        [[ -L "$link" ]] || continue
+        resolved="$(readlink -f "$link" 2>/dev/null || true)"
+        # 只删除属于 shorin-pac 的链接（指向 LIB_DIR 或已悬空），不碰用户自己的同名命令。
+        if [[ "$resolved" == "${LIB_DIR}/"* || ! -e "$link" ]]; then
+            rm -f "$link"
+            echo "  ${UNLINK_ITEM} ~/.local/bin/${name}"
+        else
+            echo "  ${UNLINK_SKIP} ~/.local/bin/${name}"
+        fi
+    done
+    echo -e "\n${UNLINK_DONE}"
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 1
+fi
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    link)
+        do_link
+        exit 0
+        ;;
+    unlink)
+        do_unlink
+        exit 0
+        ;;
+    --list-subcommands)
+        list_subcommands
+        exit 0
+        ;;
+    config)
+        if [[ -x "${LIB_DIR}/shorin-pac-config" ]]; then
+            exec "${LIB_DIR}/shorin-pac-config" "$@"
+        fi
+        echo "shorin-pac: config is not available in this build yet." >&2
+        exit 1
+        ;;
+esac
+
+for name in "${LINKABLE[@]}"; do
+    if [[ "$COMMAND" == "$name" && -x "${LIB_DIR}/${name}" ]]; then
+        exec "${LIB_DIR}/${name}" "$@"
+    fi
+done
+
+echo "shorin-pac: ${UNKNOWN_CMD} '${COMMAND}'" >&2
+exit 1
