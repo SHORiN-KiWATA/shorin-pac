@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# shorin-pac 的 AI 供应商层。被 pac / pacr / shorin-pac-config 以 `source` 方式加载。
+# shorin-pac 的共享库：AI 供应商层 + 配置界面。被 pac / pacr 以 `source` 方式加载。
 #
 # 设计要点：
 # - 只做“一次性补全”：给一份 system 提示词和一份 user 文本，拿回一段文本。
 #   没有上下文、记忆、流式；所有后端行为一致。
 # - 后端（protocol）：
 #     openai-chat   任何 OpenAI Chat Completions 兼容 HTTP 端点（含 opencode zen 公共 key）
+#     openai-responses  OpenAI Responses API 端点
 #     anthropic     Anthropic Messages HTTP 端点
 #     claude-code   本机 claude CLI（订阅额度）
 #     codex         本机 codex CLI
@@ -25,6 +26,7 @@
 #   ai_json_complete SYS USER OUT [WORKDIR] [JQ_CHECK]   补全 + 抽取 JSON + 校验（失败重试一次）
 #   ai_select_interactive         fzf 选择供应商/模型并写入配置
 #   ai_describe_selection         一行文字描述当前选择
+#   config_main [子命令]          `pac config` 入口（菜单 / select / show / set / add / remove / test / path）
 
 [[ -n "${SHORIN_PAC_AI_LOADED:-}" ]] && return 0
 SHORIN_PAC_AI_LOADED=1
@@ -64,9 +66,9 @@ ai_msg() {
     if $AI_IS_CN; then
         case "$key" in
             THINKING) printf '%s' "AI 正在分析" ;;
-            NO_PROVIDER) printf '%s' "未找到可用的 AI 供应商。请运行 shorin-pac config 配置，或安装 claude / codex / agy / opencode / miyu 之一。" ;;
+            NO_PROVIDER) printf '%s' "未找到可用的 AI 供应商。请运行 pac config 配置，或安装 claude / codex / agy / opencode / miyu 之一。" ;;
             USING) printf '%s' "使用 AI 供应商：" ;;
-            AUTO_HINT) printf '%s' "（自动选择，可用 shorin-pac config 更改）" ;;
+            AUTO_HINT) printf '%s' "（自动选择，可用 pac config 更改）" ;;
             ERR_DEPS) printf '%s' "错误：AI 功能需要 curl 和 jq。" ;;
             ERR_HTTP) printf '%s' "错误：AI 接口请求失败。" ;;
             ERR_CLI) printf '%s' "错误：AI 命令行后端执行失败。" ;;
@@ -77,15 +79,15 @@ ai_msg() {
             ERR_NO_KEY) printf '%s' "错误：该供应商没有配置 API key：" ;;
             SELECT_HEADER) printf '%s' "选择 AI 供应商 / 模型 | Enter:选择 | Esc:取消" ;;
             SELECTED) printf '%s' "已选择：" ;;
-            RATE_LIMIT) printf '%s' "供应商限流（429）。公共 key 额度有限，建议在 shorin-pac config 里配置自己的供应商。" ;;
+            RATE_LIMIT) printf '%s' "供应商限流（429）。公共 key 额度有限，建议在 pac config 里配置自己的供应商。" ;;
             *) printf '%s' "$key" ;;
         esac
     else
         case "$key" in
             THINKING) printf '%s' "AI is analyzing" ;;
-            NO_PROVIDER) printf '%s' "No usable AI provider found. Run 'shorin-pac config', or install one of claude / codex / agy / opencode / miyu." ;;
+            NO_PROVIDER) printf '%s' "No usable AI provider found. Run 'pac config', or install one of claude / codex / agy / opencode / miyu." ;;
             USING) printf '%s' "AI provider:" ;;
-            AUTO_HINT) printf '%s' "(auto-selected; change with shorin-pac config)" ;;
+            AUTO_HINT) printf '%s' "(auto-selected; change with pac config)" ;;
             ERR_DEPS) printf '%s' "Error: AI features require curl and jq." ;;
             ERR_HTTP) printf '%s' "Error: AI API request failed." ;;
             ERR_CLI) printf '%s' "Error: AI CLI backend failed." ;;
@@ -96,7 +98,7 @@ ai_msg() {
             ERR_NO_KEY) printf '%s' "Error: no API key configured for provider:" ;;
             SELECT_HEADER) printf '%s' "Select AI provider / model | Enter:select | Esc:cancel" ;;
             SELECTED) printf '%s' "Selected:" ;;
-            RATE_LIMIT) printf '%s' "Provider rate limited (429). The public key has a small quota; configure your own provider in 'shorin-pac config'." ;;
+            RATE_LIMIT) printf '%s' "Provider rate limited (429). The public key has a small quota; configure your own provider in 'pac config'." ;;
             *) printf '%s' "$key" ;;
         esac
     fi
@@ -189,7 +191,7 @@ ai_normalize_provider() {
             (.protocol // "" | ascii_downcase) as $p
             | if ($p == "" or $p == "auto") then
                 (if ((.base_url // "") | test("anthropic"; "i")) then "anthropic" else "openai-chat" end)
-              elif ($p == "openai-responses") then "openai-chat"
+              elif ($p == "openai-responses" or $p == "responses") then "openai-responses"
               elif ($p == "anthropic-messages" or $p == "claude" or $p == "claude-messages") then "anthropic"
               elif ($p == "claude-code-cli") then "claude-code"
               elif ($p == "antigravity-cli" or $p == "agy") then "antigravity"
@@ -430,7 +432,7 @@ ai_heartbeat_start() {
         while true; do
             sleep 10 &
             wait $! || exit 0
-            printf '\033[90m⏳ %s (%ss)\033[0m\n' "$label" "$((SECONDS - started))" >&2
+            printf '\033[90m   %s (%ss)\033[0m\n' "$label" "$((SECONDS - started))" >&2
         done
     ) &
     AI_HEARTBEAT_PID=$!
@@ -501,6 +503,31 @@ ai_http_openai() {
         fi
     fi
     jq -r '.choices[0].message.content // empty' "$resp" 2>/dev/null | ai_sanitize > "$out"
+    rm -f "$body" "$resp" "${resp}.curlerr"
+    [[ -s "$out" ]] || { echo "$(ai_msg ERR_EMPTY)" >&2; return 1; }
+}
+
+ai_http_openai_responses() {
+    # OpenAI Responses API：POST {base}/responses，instructions = system，input = user
+    local sys="$1" user="$2" out="$3"
+    local base key url body resp
+    base=$(jq -r '.base_url' <<< "$AI_PROVIDER_JSON")
+    key=$(ai_resolve_key "$(jq -r '.api_key' <<< "$AI_PROVIDER_JSON")")
+    [[ -n "$key" ]] || { echo "$(ai_msg ERR_NO_KEY) $AI_PROVIDER_ID" >&2; return 1; }
+    body="${out}.req"; resp="${out}.resp"
+    jq -n --arg model "$AI_MODEL" --rawfile sys "$sys" --rawfile user "$user" \
+        '{model:$model, instructions:$sys, input:$user, store:false}' > "$body"
+    url="${base}/responses"
+    if ! ai_http_post "$url" "$body" "$resp" "Authorization: Bearer ${key}"; then
+        if [[ "${AI_HTTP_CODE:-}" == "404" && "$base" != */v1 ]]; then
+            url="${base}/v1/responses"
+            ai_http_post "$url" "$body" "$resp" "Authorization: Bearer ${key}" || { ai_http_report_failure "$resp"; return 1; }
+        else
+            ai_http_report_failure "$resp"; return 1
+        fi
+    fi
+    jq -r '(.output_text // empty), ([.output[]? | select(.type == "message") | .content[]? | select(.type == "output_text") | .text] | join(""))' "$resp" 2>/dev/null \
+        | awk 'NF' | head -c "$AI_MAX_OUTPUT_BYTES" | ai_sanitize > "$out"
     rm -f "$body" "$resp" "${resp}.curlerr"
     [[ -s "$out" ]] || { echo "$(ai_msg ERR_EMPTY)" >&2; return 1; }
 }
@@ -671,6 +698,7 @@ ai_complete() {
     ai_heartbeat_start
     case "$proto" in
         openai-chat) ai_http_openai "$sys" "$user" "$out" || rc=$? ;;
+        openai-responses) ai_http_openai_responses "$sys" "$user" "$out" || rc=$? ;;
         anthropic) ai_http_anthropic "$sys" "$user" "$out" || rc=$? ;;
         claude-code) ai_cli_claude "$sys" "$user" "$out" "$workdir" || rc=$? ;;
         codex) ai_cli_codex "$sys" "$user" "$out" "$workdir" || rc=$? ;;
@@ -742,11 +770,11 @@ ai_json_complete() {
 # ------------------------------------------------------------------------------
 
 ai_selection_rows() {
-    # 每行：provider_id<TAB>model<TAB>显示文本
+    # 每行：provider_id<TAB>model<TAB>供应商显示名<TAB>来源标签
     ai_all_providers | jq -r '
         . as $p
         | (.models | if length == 0 then [""] else . end)[]
-        | [$p.id, ., ($p.display_name + "\t" + . + "\t[" + $p.source + "/" + $p.protocol + "]")]
+        | [$p.id, ., $p.display_name, ($p.source + "/" + $p.protocol)]
         | @tsv'
 }
 
@@ -756,10 +784,15 @@ ai_select_interactive() {
     rows=$(ai_selection_rows)
     [[ -n "$rows" ]] || { echo "$(ai_msg NO_PROVIDER)" >&2; return 1; }
     current="$(ai_config_get '.selected.provider // ""'):$(ai_config_get '.selected.model // ""')"
-    chosen=$(printf '%s\n' "$rows" | awk -F'\t' -v cur="$current" '{
-            mark = ($1 ":" $2 == cur) ? "*" : " "
-            printf "%s\t%s\t%s %-38s %-32s %s\n", $1, $2, mark, $3, $4, $5
-        }' | fzf --with-nth=3.. --delimiter='\t' --height=70% --layout=reverse --border \
+    chosen=$(printf '%s\n' "$rows" | awk -F'\t' -v cur="$current" '
+        BEGIN { OFS = "\t" }
+        {
+            mark = ($1 ":" $2 == cur) ? "●" : " "
+            # 显示列：标记  供应商名(定宽)  模型(定宽)  来源
+            name = $3; if (length(name) > 26) name = substr(name, 1, 25) "…"
+            model = $2; if (length(model) > 34) model = substr(model, 1, 33) "…"
+            printf "%s\t%s\t%s %-27s %-35s \033[90m%s\033[0m\n", $1, $2, mark, name, model, $4
+        }' | fzf --ansi --with-nth=3.. --delimiter='\t' --height=70% --layout=reverse --border --tiebreak=index \
             --header "$(ai_msg SELECT_HEADER)") || return 1
     provider=$(cut -f1 <<< "$chosen")
     model=$(cut -f2 <<< "$chosen")
@@ -767,4 +800,226 @@ ai_select_interactive() {
     AI_PROVIDER_JSON=""
     ai_resolve
     echo -e "\033[36m$(ai_msg SELECTED)\033[0m $(ai_describe_selection)"
+}
+
+# ==============================================================================
+# 配置界面（`pac config` / `pacr config`）
+# ==============================================================================
+
+config_msg() {
+    local key="$1"
+    if $AI_IS_CN; then
+        case "$key" in
+            MENU_HEADER) printf '%s' "AI 配置 | Enter:进入 | Esc:退出" ;;
+            M_SELECT) printf '%s' "选择供应商 / 模型" ;;
+            M_ADD) printf '%s' "添加自定义供应商" ;;
+            M_REMOVE) printf '%s' "删除自定义供应商" ;;
+            M_TEST) printf '%s' "测试当前供应商" ;;
+            M_SHOW) printf '%s' "查看当前配置" ;;
+            M_QUIT) printf '%s' "退出" ;;
+            CURRENT) printf '%s' "当前：" ;;
+            ADD_ID) printf '%s' "供应商 id（字母数字和 - _，例如 deepseek）: " ;;
+            ADD_NAME) printf '%s' "显示名称（回车用 id）: " ;;
+            ADD_URL) printf '%s' "API 地址（例如 https://api.deepseek.com/v1）: " ;;
+            ADD_PROTO) printf '%s' "协议 | Enter:选择" ;;
+            ADD_KEY) printf '%s' "API key（可写 \$env:变量名；输入不回显）: " ;;
+            ADD_FETCH) printf '%s' "正在获取模型列表..." ;;
+            ADD_MODELS_HEADER) printf '%s' "Tab:多选模型 | Enter:确认 | Esc:手动输入" ;;
+            ADD_MODELS_MANUAL) printf '%s' "模型名（逗号分隔）: " ;;
+            ADD_DONE) printf '%s' "已保存并选用供应商：" ;;
+            ADD_EXISTS) printf '%s' "错误：该 id 已存在。" ;;
+            ADD_INVALID_ID) printf '%s' "错误：id 不合法。" ;;
+            REMOVE_HEADER) printf '%s' "选择要删除的自定义供应商 | Esc:取消" ;;
+            REMOVE_NONE) printf '%s' "没有自定义供应商。" ;;
+            REMOVED) printf '%s' "已删除：" ;;
+            TEST_SENDING) printf '%s' "发送测试消息到：" ;;
+            TEST_OK) printf '%s' "测试通过，回复：" ;;
+            TEST_FAIL) printf '%s' "测试失败。" ;;
+            SHOW_SELECTED) printf '%s' "当前选择" ;;
+            SHOW_CUSTOM) printf '%s' "自定义供应商" ;;
+            SHOW_CONFIG) printf '%s' "配置文件" ;;
+            SHOW_NONE) printf '%s' "（无）" ;;
+            SET_BAD) printf '%s' "错误：找不到供应商：" ;;
+            PRESS_ENTER) printf '%s' "按回车继续..." ;;
+            *) printf '%s' "$key" ;;
+        esac
+    else
+        case "$key" in
+            MENU_HEADER) printf '%s' "AI settings | Enter:open | Esc:quit" ;;
+            M_SELECT) printf '%s' "Select provider / model" ;;
+            M_ADD) printf '%s' "Add a custom provider" ;;
+            M_REMOVE) printf '%s' "Remove a custom provider" ;;
+            M_TEST) printf '%s' "Test the current provider" ;;
+            M_SHOW) printf '%s' "Show current settings" ;;
+            M_QUIT) printf '%s' "Quit" ;;
+            CURRENT) printf '%s' "Current:" ;;
+            ADD_ID) printf '%s' "Provider id (letters, digits, - _; e.g. deepseek): " ;;
+            ADD_NAME) printf '%s' "Display name (Enter = id): " ;;
+            ADD_URL) printf '%s' "API base URL (e.g. https://api.deepseek.com/v1): " ;;
+            ADD_PROTO) printf '%s' "Protocol | Enter:select" ;;
+            ADD_KEY) printf '%s' "API key (\$env:VAR allowed; input hidden): " ;;
+            ADD_FETCH) printf '%s' "Fetching model list..." ;;
+            ADD_MODELS_HEADER) printf '%s' "Tab:multi-select models | Enter:confirm | Esc:type manually" ;;
+            ADD_MODELS_MANUAL) printf '%s' "Model names (comma separated): " ;;
+            ADD_DONE) printf '%s' "Saved and selected provider:" ;;
+            ADD_EXISTS) printf '%s' "Error: that id already exists." ;;
+            ADD_INVALID_ID) printf '%s' "Error: invalid id." ;;
+            REMOVE_HEADER) printf '%s' "Select a custom provider to remove | Esc:cancel" ;;
+            REMOVE_NONE) printf '%s' "No custom providers." ;;
+            REMOVED) printf '%s' "Removed:" ;;
+            TEST_SENDING) printf '%s' "Sending a test message to:" ;;
+            TEST_OK) printf '%s' "Test passed, reply:" ;;
+            TEST_FAIL) printf '%s' "Test failed." ;;
+            SHOW_SELECTED) printf '%s' "Selected" ;;
+            SHOW_CUSTOM) printf '%s' "Custom providers" ;;
+            SHOW_CONFIG) printf '%s' "Config file" ;;
+            SHOW_NONE) printf '%s' "(none)" ;;
+            SET_BAD) printf '%s' "Error: provider not found:" ;;
+            PRESS_ENTER) printf '%s' "Press Enter to continue..." ;;
+            *) printf '%s' "$key" ;;
+        esac
+    fi
+}
+
+config_show() {
+    local cyan=$'\033[36m' reset=$'\033[0m'
+    ai_resolve >/dev/null 2>&1 || true
+    echo "${cyan}$(config_msg SHOW_SELECTED)${reset}: $(ai_describe_selection 2>/dev/null || echo '-')"
+    echo "${cyan}$(config_msg SHOW_CUSTOM)${reset}: $(ai_config_get '[.providers[]? | .id + " (" + .protocol + ", " + (.models | join(", ")) + ")"] | join("; ")' | sed "s/^$/$(config_msg SHOW_NONE)/")"
+    echo "${cyan}$(config_msg SHOW_CONFIG)${reset}: $AI_CONFIG_FILE"
+}
+
+config_set() {
+    local spec="$1"
+    if ai_resolve "$spec" && [[ "${AI_AUTO_SELECTED:-false}" != true ]]; then
+        ai_config_update '.selected = {provider: $p, model: $m}' --arg p "$AI_PROVIDER_ID" --arg m "$AI_MODEL"
+        echo -e "\033[36m$(ai_msg SELECTED)\033[0m $(ai_describe_selection)"
+    else
+        echo "$(config_msg SET_BAD) $spec" >&2
+        return 1
+    fi
+}
+
+config_add() {
+    local id name url proto key models_json fetched chosen
+    read -r -p "$(config_msg ADD_ID)" id
+    [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "$(config_msg ADD_INVALID_ID)" >&2; return 1; }
+    if ai_all_providers | jq -e --arg id "$id" 'select(.id == $id)' >/dev/null; then
+        echo "$(config_msg ADD_EXISTS)" >&2; return 1
+    fi
+    read -r -p "$(config_msg ADD_NAME)" name; [[ -n "$name" ]] || name="$id"
+    read -r -p "$(config_msg ADD_URL)" url; url="${url%/}"
+    proto=$(printf '%s\n' "openai-chat" "openai-responses" "anthropic" | fzf --height=7 --layout=reverse --header "$(config_msg ADD_PROTO)") || return 1
+    read -r -s -p "$(config_msg ADD_KEY)" key; echo
+    models_json='[]'
+    if [[ "$proto" == openai-* ]]; then
+        echo -e "\033[90m$(config_msg ADD_FETCH)\033[0m"
+        fetched=$(curl -sS --max-time 20 -H "Authorization: Bearer $(ai_resolve_key "$key")" "${url}/models" 2>/dev/null \
+            | jq -r '.data[]?.id // empty' 2>/dev/null | sort -u || true)
+        if [[ -n "$fetched" ]]; then
+            chosen=$(printf '%s\n' "$fetched" | fzf --multi --height=60% --layout=reverse --border --header "$(config_msg ADD_MODELS_HEADER)" || true)
+            [[ -n "$chosen" ]] && models_json=$(printf '%s\n' "$chosen" | jq -R . | jq -s .)
+        fi
+    fi
+    if [[ "$models_json" == '[]' ]]; then
+        read -r -p "$(config_msg ADD_MODELS_MANUAL)" chosen
+        models_json=$(printf '%s' "$chosen" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' | jq -R . | jq -s .)
+    fi
+    ai_config_update '.providers += [{id:$id, display_name:$name, base_url:$url, protocol:$proto, api_key:$key, models:$models, default_model:($models[0] // "")}]' \
+        --arg id "$id" --arg name "$name" --arg url "$url" --arg proto "$proto" --arg key "$key" --argjson models "$models_json"
+    ai_config_update '.selected = {provider: $p, model: $m}' --arg p "$id" --arg m "$(jq -r '.[0] // ""' <<< "$models_json")"
+    echo -e "\033[32m$(config_msg ADD_DONE)\033[0m $id"
+}
+
+config_remove() {
+    local id="${1:-}" rows
+    if [[ -z "$id" ]]; then
+        rows=$(ai_config_get '.providers[]? | "\(.id)\t\(.display_name)"')
+        [[ -n "$rows" ]] || { echo "$(config_msg REMOVE_NONE)"; return 0; }
+        id=$(printf '%s\n' "$rows" | fzf --delimiter='\t' --height=40% --layout=reverse --header "$(config_msg REMOVE_HEADER)" | cut -f1) || return 1
+        [[ -n "$id" ]] || return 0
+    fi
+    ai_config_update '.providers = [.providers[] | select(.id != $id)] | if .selected.provider == $id then .selected = {provider:"", model:""} else . end' --arg id "$id"
+    echo -e "\033[33m$(config_msg REMOVED)\033[0m $id"
+}
+
+config_toggle() {
+    local key="$1" value="$2"
+    case "$value" in
+        on|true|1) value=true ;;
+        off|false|0) value=false ;;
+        *) echo "usage: pac config $key on|off" >&2; return 1 ;;
+    esac
+    ai_config_update ".${key} = \$v" --argjson v "$value"
+    ai_init
+}
+
+config_test() {
+    ai_resolve || return 1
+    echo -e "\033[90m$(config_msg TEST_SENDING)\033[0m $(ai_describe_selection)"
+    local tmp sys user out
+    tmp=$(mktemp -d -t shorin-pac-test.XXXXXX)
+    sys="$tmp/sys"; user="$tmp/user"; out="$tmp/out"
+    printf 'You are a connectivity test. Reply with exactly the word PONG and nothing else.' > "$sys"
+    printf 'ping' > "$user"
+    if ai_complete "$sys" "$user" "$out" "$tmp" && [[ -s "$out" ]]; then
+        echo -e "\033[32m$(config_msg TEST_OK)\033[0m $(head -c 200 "$out" | tr -d '\n')"
+        rm -rf "$tmp"; return 0
+    fi
+    echo -e "\033[31m$(config_msg TEST_FAIL)\033[0m" >&2
+    rm -rf "$tmp"; return 1
+}
+
+config_menu() {
+    command -v fzf >/dev/null 2>&1 || { echo "pac config: fzf is required for the menu" >&2; return 1; }
+    local choice
+    while true; do
+        ai_resolve >/dev/null 2>&1 || true
+        choice=$(printf '%s\n' \
+            "select	$(config_msg M_SELECT)	$(config_msg CURRENT) $(ai_describe_selection 2>/dev/null || echo -)" \
+            "add	$(config_msg M_ADD)	" \
+            "remove	$(config_msg M_REMOVE)	" \
+            "test	$(config_msg M_TEST)	" \
+            "show	$(config_msg M_SHOW)	" \
+            "quit	$(config_msg M_QUIT)	" \
+            | awk -F'\t' '{ printf "%s\t%-28s \033[90m%s\033[0m\n", $1, $2, $3 }' \
+            | fzf --ansi --delimiter='\t' --with-nth=2.. --height=12 --layout=reverse --border --header "$(config_msg MENU_HEADER)" \
+            | cut -f1) || return 0
+        case "$choice" in
+            select) ai_select_interactive || true ;;
+            add) config_add || true ;;
+            remove) config_remove || true ;;
+            test) config_test || true; read -r -p "$(config_msg PRESS_ENTER)" _ || true ;;
+            show) config_show; read -r -p "$(config_msg PRESS_ENTER)" _ || true ;;
+            quit|"") return 0 ;;
+        esac
+    done
+}
+
+config_main() {
+    ai_init || return 1
+    case "${1:-}" in
+        "") config_menu ;;
+        select) ai_select_interactive ;;
+        show) config_show ;;
+        set) [[ -n "${2:-}" ]] || { echo "usage: pac config set <provider[:model]>" >&2; return 1; }; config_set "$2" ;;
+        add) config_add ;;
+        remove) config_remove "${2:-}" ;;
+        tools) config_toggle allow_tools "${2:-}" ;;
+        miyu) config_toggle import_miyu "${2:-}" ;;
+        test) config_test ;;
+        path) echo "$AI_CONFIG_FILE" ;;
+        -h|--help|help)
+            cat <<'EOF'
+pac config                 interactive menu / 交互菜单
+pac config select          choose provider and model / 选择供应商与模型
+pac config show            show current settings / 查看当前配置
+pac config set <provider[:model]>
+pac config add | remove [id]
+pac config test            send a test message / 发一条测试消息
+pac config path            print the config file path
+EOF
+            ;;
+        *) echo "pac config: unknown subcommand '$1'" >&2; return 1 ;;
+    esac
 }

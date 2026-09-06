@@ -2,7 +2,7 @@
 
 pkgname=shorin-pac-git
 _pkgname=shorin-pac
-pkgver=r26.0000000
+pkgver=r30.0000000
 pkgrel=1
 pkgdesc="Simple fzf-based TUI to install/remove pacman, AUR and Flatpak packages on Arch, with AI-assisted AUR review and leftover cleanup"
 arch=('any')
@@ -34,35 +34,35 @@ pkgver() {
 package() {
     cd "${_pkgname}"
 
-    # 子命令脚本进私有库目录；调度器进 /usr/bin。
-    install -dm755 "${pkgdir}/usr/lib/${_pkgname}"
-    local script
-    for script in bin/*; do
-        [[ "$(basename "$script")" == "shorin-pac" ]] && continue
-        install -Dm755 "$script" "${pkgdir}/usr/lib/${_pkgname}/$(basename "$script")"
-    done
-    install -Dm755 bin/shorin-pac "${pkgdir}/usr/bin/shorin-pac"
+    # 命令直接进 /usr/bin：pac（安装）、pacr（卸载）；`pac config` 配置 AI
+    install -Dm755 bin/pac "${pkgdir}/usr/bin/pac"
+    install -Dm755 bin/pacr "${pkgdir}/usr/bin/pacr"
 
-    # 共享库与提示词（后续版本加入；目录不存在时跳过）。
-    if [[ -d lib ]]; then
-        install -dm755 "${pkgdir}/usr/lib/${_pkgname}/lib"
-        find lib -type f -exec install -Dm644 {} "${pkgdir}/usr/lib/${_pkgname}/{}" \;
-    fi
-    if [[ -d prompts ]]; then
-        install -dm755 "${pkgdir}/usr/lib/${_pkgname}/prompts"
-        find prompts -type f -exec install -Dm644 {} "${pkgdir}/usr/lib/${_pkgname}/{}" \;
-    fi
+    # 共享库与提示词
+    install -Dm644 lib/shorin-pac.sh "${pkgdir}/usr/lib/${_pkgname}/lib/shorin-pac.sh"
+    local f
+    for f in prompts/*.md; do
+        install -Dm644 "$f" "${pkgdir}/usr/lib/${_pkgname}/prompts/$(basename "$f")"
+    done
 
     install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 
     # fish 补全
     install -dm755 "${pkgdir}/usr/share/fish/vendor_completions.d"
-    cat << 'EOF' > "${pkgdir}/usr/share/fish/vendor_completions.d/shorin-pac.fish"
-complete -c shorin-pac -f
-complete -c shorin-pac -n '__fish_use_subcommand' -a 'pac' -d 'Install packages (pacman/AUR/Flatpak TUI)'
-complete -c shorin-pac -n '__fish_use_subcommand' -a 'pacr' -d 'Remove packages TUI'
-complete -c shorin-pac -n '__fish_use_subcommand' -a 'config' -d 'Configure AI provider and model'
-complete -c shorin-pac -n '__fish_use_subcommand' -a 'link' -d 'Symlink pac/pacr into ~/.local/bin'
-complete -c shorin-pac -n '__fish_use_subcommand' -a 'unlink' -d 'Remove pac/pacr symlinks'
-EOF
+    cat << 'FISH' > "${pkgdir}/usr/share/fish/vendor_completions.d/pac.fish"
+complete -c pac -f
+complete -c pac -n '__fish_use_subcommand' -a 'config' -d 'Configure AI provider and model'
+complete -c pac -l check -s c -d 'Review AUR packages only'
+complete -c pac -l refresh -s y -d 'Force refresh AUR list'
+complete -c pac -l ai -r -d 'AI provider[:model] for this run'
+FISH
+    cat << 'FISH' > "${pkgdir}/usr/share/fish/vendor_completions.d/pacr.fish"
+complete -c pacr -f
+complete -c pacr -n '__fish_use_subcommand' -a 'config' -d 'Configure AI provider and model'
+complete -c pacr -l clean -d 'Detect leftovers with AI (no prompt)'
+complete -c pacr -l no-clean -d 'Skip leftover detection'
+complete -c pacr -l scan -d 'Only list leftovers'
+complete -c pacr -l rm -d 'Delete leftovers instead of trashing'
+complete -c pacr -l ai -r -d 'AI provider[:model] for this run'
+FISH
 }

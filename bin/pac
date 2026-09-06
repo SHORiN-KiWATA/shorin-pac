@@ -94,13 +94,25 @@ REVIEW_MAX_DOSSIER_BYTES=$((1024 * 1024))
 # 获取脚本自身的绝对路径，确保在 fzf 子进程 reload 时能准确自我调用
 SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-# AI 供应商层：已安装时在 /usr/lib/shorin-pac/lib/ai.sh，源码仓库里在 bin/../lib/ai.sh
-if [[ -r "${SCRIPT_DIR}/lib/ai.sh" ]]; then
-    AI_LIB="${SCRIPT_DIR}/lib/ai.sh"
-elif [[ -r "${SCRIPT_DIR}/../lib/ai.sh" ]]; then
-    AI_LIB="${SCRIPT_DIR}/../lib/ai.sh"
+# 共享库：源码仓库里在 bin/../lib/shorin-pac.sh，安装后在 /usr/lib/shorin-pac/lib/shorin-pac.sh
+if [[ -r "${SCRIPT_DIR}/../lib/shorin-pac.sh" ]]; then
+    AI_LIB="${SCRIPT_DIR}/../lib/shorin-pac.sh"
+elif [[ -r /usr/lib/shorin-pac/lib/shorin-pac.sh ]]; then
+    AI_LIB="/usr/lib/shorin-pac/lib/shorin-pac.sh"
 else
     AI_LIB=""
+fi
+
+# `pac config [...]`：AI 配置界面
+if [[ "${1:-}" == "config" ]]; then
+    shift
+    [[ -n "$AI_LIB" ]] || { echo "pac: lib/shorin-pac.sh not found" >&2; exit 1; }
+    SHORIN_PAC_LOCALE="$ORIGINAL_LANG"
+    export LC_ALL="$ORIGINAL_LANG"
+    # shellcheck source=/dev/null
+    source "$AI_LIB"
+    config_main "$@"
+    exit $?
 fi
 
 # --- 2. 参数解析 ---
@@ -151,8 +163,9 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[OPT_CHECK]="  --check, -c   仅审查 AUR 包，不安装"
     MSG[OPT_AI]="  --ai <供应商[:模型]>  本次使用指定的 AI 供应商/模型 (例：--ai claude-code:sonnet)"
     MSG[OPT_AI_MODEL]="  --ai-model <模型>     只更换当前供应商下的模型"
+    MSG[OPT_CONFIG]="  config [子命令]       配置 AI 供应商与模型（pac config --help 查看子命令）"
     MSG[ENV]="环境变量："
-    MSG[ENV_AI]="  SHORIN_PAC_AI=<供应商[:模型]>  等价于 --ai；持久配置请用 shorin-pac config"
+    MSG[ENV_AI]="  SHORIN_PAC_AI=<供应商[:模型]>  等价于 --ai；持久配置请用 pac config"
     MSG[FEAT]="功能特性："
     MSG[FEAT_1]="- 准确状态：显示 [已安装] 标记"
     MSG[FEAT_2]="- 视觉区分：蓝色(官方) 紫色(AUR)"
@@ -181,7 +194,7 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[REVIEW_ASK_HINT]="AUR 包由用户维护，可能存在风险，建议审查；输入 m 更换 AI 供应商/模型。"
     MSG[REVIEW_MODEL]="当前 AI：%s"
     MSG[REVIEW_ASK_PROMPT]="进行审查? [Y/n/m] "
-    MSG[AI_UNAVAILABLE]="AI 审查不可用（未找到可用供应商）。运行 shorin-pac config 配置，或安装 claude / codex / agy / opencode / miyu 之一。"
+    MSG[AI_UNAVAILABLE]="AI 审查不可用（未找到可用供应商）。运行 pac config 配置，或安装 claude / codex / agy / opencode / miyu 之一。"
     MSG[AI_UNAVAILABLE_SHORT]="AI 审查不可用，无法审查此包。"
     MSG[REVIEW_ASK_PROMPT_NOAI]="不审查直接安装? [y/N] "
     MSG[INSTALL_RISK_LOW]="🟢低风险"
@@ -197,14 +210,12 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[RECOMMEND_CONTINUE]="建议可继续安装"
     MSG[RECOMMEND_CAUTION]="建议谨慎安装"
     MSG[RECOMMEND_CANCEL]="建议取消安装"
-    MSG[REPORT_ESCALATED]="（pac 按发现项数量把风险等级上调了，模型给出的等级偏低）"
-    MSG[REPORT_TOOLS_HINT]="AI 可使用只读工具补充查证"
     MSG[SKIPPED]="已跳过安装："
     MSG[CHECK_SKIP_REPO]="仅审查模式会跳过非 AUR 包："
     MSG[CHECK_DONE]="审查完成，未执行安装。"
     MSG[CHECK_FAILED]="AUR 审查存在失败项，未执行安装。"
     MSG[ERR_REVIEW]="错误：AUR 审查失败。"
-    MSG[ERR_AI_LIB]="错误：找不到 AI 供应商层 lib/ai.sh，安装可能不完整。"
+    MSG[ERR_AI_LIB]="错误：找不到共享库 lib/shorin-pac.sh，安装可能不完整。"
     MSG[ERR_REVIEW_METADATA]="错误：无法完整收集 AUR 元数据。"
     MSG[ERR_REVIEW_FILES]="错误：无法完整收集待审查的 AUR 文件。"
     MSG[REVIEW_FAILED_CONFIRM]="AUR 审查失败，仍然继续安装 %s? [y/N] "
@@ -216,8 +227,9 @@ else
     MSG[OPT_CHECK]="  --check, -c   Review AUR packages only; do not install"
     MSG[OPT_AI]="  --ai <provider[:model]>  Use this AI provider/model for this run (e.g. --ai claude-code:sonnet)"
     MSG[OPT_AI_MODEL]="  --ai-model <model>       Only switch the model of the current provider"
+    MSG[OPT_CONFIG]="  config [subcommand]      Configure the AI provider and model (pac config --help)"
     MSG[ENV]="Environment:"
-    MSG[ENV_AI]="  SHORIN_PAC_AI=<provider[:model]>  Same as --ai; use 'shorin-pac config' for a persistent choice"
+    MSG[ENV_AI]="  SHORIN_PAC_AI=<provider[:model]>  Same as --ai; use 'pac config' for a persistent choice"
     MSG[FEAT]="Features:"
     MSG[FEAT_1]="- Accurate status: [Installed] tag"
     MSG[FEAT_2]="- Visuals: Blue(Repo) Purple(AUR)"
@@ -246,7 +258,7 @@ else
     MSG[REVIEW_ASK_HINT]="AUR packages are user-maintained and may be risky; review is recommended; enter m to change the AI provider/model."
     MSG[REVIEW_MODEL]="Current AI: %s"
     MSG[REVIEW_ASK_PROMPT]="Run review? [Y/n/m] "
-    MSG[AI_UNAVAILABLE]="AI review unavailable (no usable provider). Run 'shorin-pac config', or install one of claude / codex / agy / opencode / miyu."
+    MSG[AI_UNAVAILABLE]="AI review unavailable (no usable provider). Run 'pac config', or install one of claude / codex / agy / opencode / miyu."
     MSG[AI_UNAVAILABLE_SHORT]="AI review unavailable; this package cannot be reviewed."
     MSG[REVIEW_ASK_PROMPT_NOAI]="Install without review? [y/N] "
     MSG[INSTALL_RISK_LOW]="🟢Low Risk"
@@ -262,14 +274,12 @@ else
     MSG[RECOMMEND_CONTINUE]="Recommended to continue installation"
     MSG[RECOMMEND_CAUTION]="Recommended to install with caution"
     MSG[RECOMMEND_CANCEL]="Recommended to cancel installation"
-    MSG[REPORT_ESCALATED]="(pac raised the risk level based on the number of findings; the model's level was too low)"
-    MSG[REPORT_TOOLS_HINT]="the AI may use read-only tools to verify"
     MSG[SKIPPED]="Skipped install:"
     MSG[CHECK_SKIP_REPO]="Check-only mode skips non-AUR packages:"
     MSG[CHECK_DONE]="Review completed; no install was performed."
     MSG[CHECK_FAILED]="One or more AUR reviews failed; no install was performed."
     MSG[ERR_REVIEW]="Error: AUR review failed."
-    MSG[ERR_AI_LIB]="Error: lib/ai.sh (AI provider layer) not found; the installation may be incomplete."
+    MSG[ERR_AI_LIB]="Error: lib/shorin-pac.sh not found; the installation may be incomplete."
     MSG[ERR_REVIEW_METADATA]="Error: Could not collect complete AUR metadata."
     MSG[ERR_REVIEW_FILES]="Error: Could not collect all AUR files for review."
     MSG[REVIEW_FAILED_CONFIRM]="AUR review failed. Continue installing %s anyway? [y/N] "
@@ -286,6 +296,7 @@ ${MSG[OPT_REFRESH]}
 ${MSG[OPT_CHECK]}
 ${MSG[OPT_AI]}
 ${MSG[OPT_AI_MODEL]}
+${MSG[OPT_CONFIG]}
 
 ${MSG[ENV]}
 ${MSG[ENV_AI]}
@@ -303,7 +314,7 @@ ${MSG[FEAT]}
 ${MSG[EX]}
   ${0##*/} firefox        # 搜索 'firefox'
   ${0##*/} -y             # 强制刷新 AUR 列表并列出所有包
-  shorin-pac config       # 配置 AI 供应商 / configure the AI provider
+  ${0##*/} config         # 配置 AI 供应商 / configure the AI provider
 EOF_HELP
     exit 0
 fi
@@ -499,12 +510,13 @@ build_review_dossier() {
         return 1
     fi
 
+    local gray=$'\033[90m' reset=$'\033[0m'
     printf '$ LC_ALL=C ls -la --\n'
     if ! directory_listing=$(cd "$build_dir" && LC_ALL=C ls -la --); then
         echo "${MSG[ERR_REVIEW_FILES]}" >&2
         return 1
     fi
-    printf '%s\n' "$directory_listing" | sanitize_terminal_output
+    printf '%s\n' "$directory_listing" | sanitize_terminal_output | sed "s/^/${gray}/; s/\$/${reset}/"
     printf '\n'
 
     printf '$ %q --aur -Si %q 2>&1\n' "$AUR_HELPER" "$pkg"
@@ -512,7 +524,7 @@ build_review_dossier() {
         echo "${MSG[ERR_REVIEW_METADATA]}" >&2
         return 1
     fi
-    printf '%s\n' "$helper_info" | sanitize_terminal_output
+    printf '%s\n' "$helper_info" | sanitize_terminal_output | sed "s/^/${gray}/; s/\$/${reset}/"
     printf '\n'
 
     printf '$ curl --silent --show-error --fail --get --data-urlencode %q %q\n' \
@@ -535,12 +547,12 @@ build_review_dossier() {
         echo "${MSG[ERR_REVIEW_METADATA]}" >&2
         return 1
     fi
-    printf '%s' "$pretty_rpc" | jq -r '.results[0] | "Maintainer=\(.Maintainer) Votes=\(.NumVotes) Popularity=\(.Popularity) OutOfDate=\(.OutOfDate) FirstSubmitted=\(.FirstSubmitted | todate) LastModified=\(.LastModified | todate)"' | sanitize_terminal_output
+    printf '%s' "$pretty_rpc" | jq -r '.results[0] | "Maintainer=\(.Maintainer) Votes=\(.NumVotes) Popularity=\(.Popularity) OutOfDate=\(.OutOfDate) FirstSubmitted=\(.FirstSubmitted | todate) LastModified=\(.LastModified | todate)"' | sanitize_terminal_output | sed "s/^/${gray}/; s/\$/${reset}/"
     printf '\n'
 
     printf '$ git log --max-count=128 --format=<commit/time/author/subject> -- .\n'
     git_history=$(collect_aur_git_history "$build_dir")
-    printf '%s\n' "$git_history" | sanitize_terminal_output
+    printf '%s\n' "$git_history" | sanitize_terminal_output | sed "s/^/${gray}/; s/\$/${reset}/"
     printf '\n'
 
 
@@ -609,7 +621,7 @@ build_review_dossier() {
                 echo "${MSG[ERR_REVIEW_FILES]}" >&2
                 return 1
             fi
-            printf '→ Inspect %q (symlink target=%q, %s)\n' "$relative" "$target" "$target_scope"
+            printf '%s→ Inspect %q (symlink target=%q, %s)%s\n' "$gray" "$relative" "$target" "$target_scope" "$reset"
             continue
         fi
 
@@ -629,7 +641,7 @@ build_review_dossier() {
                 echo "${MSG[ERR_REVIEW_FILES]}" >&2
                 return 1
             fi
-            printf '→ Read %q\n' "$relative"
+            printf '%s→ Read %q%s\n' "$gray" "$relative" "$reset"
         else
             if ! jq -cn --arg path "$relative" --arg mode "$mode" --arg hash "$hash" \
                 --argjson bytes "$size" \
@@ -638,7 +650,7 @@ build_review_dossier() {
                 echo "${MSG[ERR_REVIEW_FILES]}" >&2
                 return 1
             fi
-            printf '→ Inspect %q (binary or non-UTF-8 metadata only)\n' "$relative"
+            printf '%s→ Inspect %q (binary or non-UTF-8 metadata only)%s\n' "$gray" "$relative" "$reset"
         fi
     done
 
@@ -716,39 +728,16 @@ run_aur_review() {
     local pkg="$1" build_dir="$2" dossier="$3" result="$4"
     local sys="${TMP_DIR}/review-${pkg}.system"
     compose_review_prompt "$sys"
-    if ai_backend_has_tools; then
-        echo -e "\033[90m> AI: $(ai_describe_selection) · ${MSG[REPORT_TOOLS_HINT]}\033[0m"
-    else
-        echo -e "\033[90m> AI: $(ai_describe_selection)\033[0m"
-    fi
+    echo -e "\033[90m> AI: $(ai_describe_selection)\033[0m"
     ai_json_complete "$sys" "$dossier" "$result" "$build_dir" "$REVIEW_JQ_CHECK"
 }
 
 normalize_review_result() {
-    # 程序把关：按发现项推导的等级不得低于模型给的等级；安装默认值由程序决定，不信模型
     local result="$1"
-    local red yellow risk implied rec
-    red=$(jq '[.findings[] | select(.level == "red")] | length' "$result")
-    yellow=$(jq '[.findings[] | select(.level == "yellow")] | length' "$result")
+    local risk rec
     risk=$(jq -r '.risk' "$result")
     rec=$(jq -r '.recommendation' "$result")
-    if (( red >= 1 || yellow >= 2 )); then
-        implied="high"
-    elif (( yellow >= 1 )); then
-        implied="medium"
-    else
-        implied="low"
-    fi
-    REVIEW_ESCALATED=false
-    case "${risk}:${implied}" in
-        low:medium|low:high|medium:high)
-            risk="$implied"
-            REVIEW_ESCALATED=true
-            ;;
-    esac
-    if [[ "$risk" != "low" && "$rec" == "continue" ]]; then
-        rec="caution"
-    fi
+    # 风险等级与建议按模型给的来；程序只决定“安装确认的默认值”
     REVIEW_RISK="$risk"
     REVIEW_RECOMMENDATION="$rec"
     if [[ "$risk" == "low" && "$rec" == "continue" ]]; then
@@ -794,9 +783,6 @@ render_review_report() {
         cancel) echo "- ${MSG[RECOMMEND_CANCEL]}" ;;
     esac
     jq -r '.notes[]? | select(type == "string" and length > 0) | "- " + .' "$result"
-    if [[ "$REVIEW_ESCALATED" == true ]]; then
-        echo "${gray}${MSG[REPORT_ESCALATED]}${reset}"
-    fi
 }
 
 review_risk_label() {

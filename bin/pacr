@@ -66,12 +66,23 @@ AI_MODEL_OVERRIDE=""
 MAX_CANDIDATES=80
 MAX_TOKEN_SEARCH_DEPTH=3
 
-if [[ -r "${SCRIPT_DIR}/lib/ai.sh" ]]; then
-    AI_LIB="${SCRIPT_DIR}/lib/ai.sh"
-elif [[ -r "${SCRIPT_DIR}/../lib/ai.sh" ]]; then
-    AI_LIB="${SCRIPT_DIR}/../lib/ai.sh"
+if [[ -r "${SCRIPT_DIR}/../lib/shorin-pac.sh" ]]; then
+    AI_LIB="${SCRIPT_DIR}/../lib/shorin-pac.sh"
+elif [[ -r /usr/lib/shorin-pac/lib/shorin-pac.sh ]]; then
+    AI_LIB="/usr/lib/shorin-pac/lib/shorin-pac.sh"
 else
     AI_LIB=""
+fi
+
+# `pacr config [...]`：与 pac config 相同
+if [[ "${1:-}" == "config" ]]; then
+    shift
+    [[ -n "$AI_LIB" ]] || { echo "pacr: lib/shorin-pac.sh not found" >&2; exit 1; }
+    SHORIN_PAC_LOCALE="$ORIGINAL_LANG"
+    # shellcheck source=/dev/null
+    source "$AI_LIB"
+    config_main "$@"
+    exit $?
 fi
 
 declare -A MSG
@@ -100,29 +111,29 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[CLEAN_ASK_BODY]="将卸载：%s"
     MSG[CLEAN_ASK_HINT]="检测家目录中属于这些软件的配置/缓存/数据，勾选后在卸载成功后移入回收站；输入 m 更换 AI。"
     MSG[CLEAN_ASK_MODEL]="当前 AI：%s"
-    MSG[CLEAN_ASK_PROMPT]="是否使用 AI 检测卸载残留? [y/N/m] "
-    MSG[AI_UNAVAILABLE]="AI 不可用（未找到可用供应商），将只按名称启发式列出残留。运行 shorin-pac config 可配置。"
-    MSG[COLLECTING]=">> 正在收集包信息与家目录候选..."
-    MSG[TOKENS]="匹配关键词："
-    MSG[CANDIDATES]="候选 %s 项"
+    MSG[CLEAN_ASK_PROMPT]="是否使用 AI 检测卸载残留? [Y/n/m] "
+    MSG[AI_UNAVAILABLE]="AI 不可用（未找到可用供应商），将只按名称启发式列出残留。运行 pac config 可配置。"
+    MSG[COLLECTING]=">> 正在收集..."
+    MSG[TOKENS]="关键词："
+    MSG[CANDIDATES]="候选：%s 项"
     MSG[NO_CANDIDATES]="未在家目录发现相关残留。"
     MSG[AI_FAILED]="AI 检测失败，改为按名称启发式列出残留。"
-    MSG[AI_NOTES]="AI 备注："
+    MSG[AI_NOTES]=">> AI 备注"
     MSG[PICK_HEADER]="Tab:勾选/取消 | Enter:确认 | Esc:不清理 | 高置信度已预选"
     MSG[PICK_PROMPT]="残留清单> "
     MSG[PICK_NONE]="未勾选任何残留。"
-    MSG[PICKED]="将在卸载成功后移入回收站 %s 项："
-    MSG[PICKED_RM]="将在卸载成功后直接删除 %s 项："
+    MSG[PICKED]=">> 残留清单（卸载成功后移入回收站，共 %s 项）"
+    MSG[PICKED_RM]=">> 残留清单（卸载成功后直接删除，共 %s 项）"
     MSG[SCAN_DONE]="仅扫描模式：未卸载、未删除。"
     MSG[CONFIRM_REMOVE]="继续卸载? [Y/n] "
     MSG[CANCELLED]="已取消。"
     MSG[REMOVE_FAILED]="卸载未成功完成，残留未处理。"
-    MSG[TRASHING]=">> 正在处理残留："
+    MSG[TRASHING]=">> 正在处理残留"
     MSG[TRASHED]="已移入回收站："
     MSG[DELETED]="已删除："
     MSG[TRASH_FAILED]="处理失败："
-    MSG[TRASH_BACKEND]="回收站后端："
-    MSG[DONE]="完成。"
+    MSG[TRASH_BACKEND]="回收站："
+    MSG[DONE]="完成：%s 项已处理"
     MSG[SRC_AI]="AI"
     MSG[SRC_HEURISTIC]="名称匹配"
     MSG[SRC_AI_EXTRA]="AI 自行发现"
@@ -154,29 +165,29 @@ else
     MSG[CLEAN_ASK_BODY]="Removing: %s"
     MSG[CLEAN_ASK_HINT]="Find config/cache/data in HOME that belong to these packages; selected items are trashed after a successful removal. Enter m to change the AI."
     MSG[CLEAN_ASK_MODEL]="Current AI: %s"
-    MSG[CLEAN_ASK_PROMPT]="Detect leftovers with AI? [y/N/m] "
-    MSG[AI_UNAVAILABLE]="AI unavailable (no usable provider); leftovers will be listed by name heuristics only. Run 'shorin-pac config' to set one up."
-    MSG[COLLECTING]=">> Collecting package info and HOME candidates..."
-    MSG[TOKENS]="Match tokens:"
-    MSG[CANDIDATES]="%s candidates"
+    MSG[CLEAN_ASK_PROMPT]="Detect leftovers with AI? [Y/n/m] "
+    MSG[AI_UNAVAILABLE]="AI unavailable (no usable provider); leftovers will be listed by name heuristics only. Run 'pac config' to set one up."
+    MSG[COLLECTING]=">> Collecting..."
+    MSG[TOKENS]="Tokens:"
+    MSG[CANDIDATES]="Candidates: %s"
     MSG[NO_CANDIDATES]="No related leftovers found in HOME."
     MSG[AI_FAILED]="AI detection failed; falling back to name heuristics."
-    MSG[AI_NOTES]="AI notes:"
+    MSG[AI_NOTES]=">> AI notes"
     MSG[PICK_HEADER]="Tab:toggle | Enter:confirm | Esc:skip cleanup | high-confidence items preselected"
     MSG[PICK_PROMPT]="leftovers> "
     MSG[PICK_NONE]="No leftovers selected."
-    MSG[PICKED]="%s item(s) will be trashed after a successful removal:"
-    MSG[PICKED_RM]="%s item(s) will be deleted after a successful removal:"
+    MSG[PICKED]=">> Leftovers (trashed after a successful removal, %s item(s))"
+    MSG[PICKED_RM]=">> Leftovers (deleted after a successful removal, %s item(s))"
     MSG[SCAN_DONE]="Scan-only mode: nothing was removed or deleted."
     MSG[CONFIRM_REMOVE]="Continue with removal? [Y/n] "
     MSG[CANCELLED]="Cancelled."
     MSG[REMOVE_FAILED]="Removal did not complete successfully; leftovers were left untouched."
-    MSG[TRASHING]=">> Processing leftovers:"
+    MSG[TRASHING]=">> Processing leftovers"
     MSG[TRASHED]="Trashed:"
     MSG[DELETED]="Deleted:"
     MSG[TRASH_FAILED]="Failed:"
-    MSG[TRASH_BACKEND]="Trash backend:"
-    MSG[DONE]="Done."
+    MSG[TRASH_BACKEND]="trash:"
+    MSG[DONE]="Done: %s item(s) processed"
     MSG[SRC_AI]="AI"
     MSG[SRC_HEURISTIC]="name match"
     MSG[SRC_AI_EXTRA]="found by AI"
@@ -519,7 +530,7 @@ run_leftover_ai() {
         if ai_backend_has_tools; then cat "${AI_PROMPT_DIR}/leftover-scan-tools.md"; fi
         printf '\nLanguage: write `reason` and `notes` in %s.\n' "$(ai_lang_name)"
     } > "$sys"
-    echo -e "\033[90m> AI: $(ai_describe_selection)\033[0m"
+    echo -e "\033[36m>> AI\033[0m \033[90m$(ai_describe_selection)\033[0m"
     ai_json_complete "$sys" "$dossier" "$result" "$HOME" "$LEFTOVER_JQ_CHECK"
 }
 
@@ -636,20 +647,27 @@ process_leftovers() {
     # process_leftovers：对 $PICK_FILE 里的路径逐个入回收站；再次校验边界
     local path ok=0 fail=0 backend
     backend=$(trash_backend)
-    echo -e "\n\033[36m${MSG[TRASHING]}\033[0m \033[90m${MSG[TRASH_BACKEND]} ${backend}\033[0m"
+    local shown
+    echo -e "\n\033[36m${MSG[TRASHING]}\033[0m \033[90m(${MSG[TRASH_BACKEND]} ${backend})\033[0m"
     while IFS= read -r path; do
         [[ -n "$path" ]] || continue
+        shown="${path/#$HOME/\~}"
         if [[ ! -e "$path" || -L "$path" ]] || is_denied "$path"; then
-            echo -e "  \033[31m${MSG[TRASH_FAILED]}\033[0m $path"; fail=$((fail + 1)); continue
+            echo -e "   \033[31m${MSG[TRASH_FAILED]}\033[0m $shown"; fail=$((fail + 1)); continue
         fi
         if trash_path "$path"; then
-            if [[ "$backend" == rm ]]; then echo -e "  \033[33m${MSG[DELETED]}\033[0m $path"; else echo -e "  \033[32m${MSG[TRASHED]}\033[0m $path"; fi
+            if [[ "$backend" == rm ]]; then echo -e "   \033[33m${MSG[DELETED]}\033[0m $shown"; else echo -e "   \033[32m${MSG[TRASHED]}\033[0m $shown"; fi
             ok=$((ok + 1))
         else
-            echo -e "  \033[31m${MSG[TRASH_FAILED]}\033[0m $path"; fail=$((fail + 1))
+            echo -e "   \033[31m${MSG[TRASH_FAILED]}\033[0m $shown"; fail=$((fail + 1))
         fi
     done < "$PICK_FILE"
-    echo -e "\033[36m${MSG[DONE]}\033[0m ($ok ok, $fail failed)"
+    echo
+    if (( fail > 0 )); then
+        printf "\033[33m${MSG[DONE]}\033[0m (%s failed)\n" "$ok" "$fail"
+    else
+        printf "\033[36m${MSG[DONE]}\033[0m\n" "$ok"
+    fi
 }
 
 leftover_scan() {
@@ -669,12 +687,13 @@ leftover_scan() {
     local p
     for p in "${PAC_PKGS[@]}"; do collect_pacman_meta "$p"; done
     for p in "${FPK_PKGS[@]}"; do collect_flatpak_meta "$p"; done
-    echo -e "\033[90m${MSG[TOKENS]} ${TOKENS[*]:-}\033[0m"
+    echo -e "   \033[90m${MSG[TOKENS]} ${TOKENS[*]:-}\033[0m"
     enumerate_candidates
     # Flatpak 的数据目录是确定的，直接补进候选
     for p in "${FPK_PKGS[@]}"; do emit_candidate "$HOME/.var/app/$p" ".var/app" "$p"; done
     if [[ -s "$CAND_FILE" ]]; then score_candidates; fi
-    printf "\033[90m${MSG[CANDIDATES]}\033[0m\n" "$(grep -c . "$CAND_FILE" || true)"
+    printf "   \033[90m${MSG[CANDIDATES]}\033[0m\n" "$(grep -c . "$CAND_FILE" || true)"
+    echo
 
     if [[ "$AI_LOADED" == true ]]; then
         jq -n --arg home "$HOME" \
@@ -696,25 +715,26 @@ leftover_scan() {
         local notes
         notes=$(jq -r '.notes[]? | select(type == "string" and length > 0) | "  - " + .' "$RESULT" 2>/dev/null || true)
         if [[ -n "$notes" ]]; then
-            echo -e "\033[36m${MSG[AI_NOTES]}\033[0m"
-            printf '%s\n' "$notes"
+            echo -e "\n\033[36m${MSG[AI_NOTES]}\033[0m"
+            printf '%s\n' "$notes" | sed 's/^  - /   - /'
         fi
     fi
     if [[ ! -s "$FINAL_FILE" ]]; then
-        echo -e "\033[32m${MSG[NO_CANDIDATES]}\033[0m"
+        echo -e "\n\033[32m${MSG[NO_CANDIDATES]}\033[0m"
         return 0
     fi
     pick_leftovers
     if [[ ! -s "$PICK_FILE" ]]; then
-        echo -e "\033[33m${MSG[PICK_NONE]}\033[0m"
+        echo -e "\n\033[33m${MSG[PICK_NONE]}\033[0m"
         return 0
     fi
+    echo
     if [[ "$USE_RM" == true ]]; then
         printf "\033[33m${MSG[PICKED_RM]}\033[0m\n" "$(grep -c . "$PICK_FILE")"
     else
         printf "\033[36m${MSG[PICKED]}\033[0m\n" "$(grep -c . "$PICK_FILE")"
     fi
-    sed "s#^$HOME#~#; s/^/  /" "$PICK_FILE"
+    sed "s#^$HOME#~#; s/^/   /" "$PICK_FILE"
 }
 
 # --- 7. 交互式 FZF 渲染与智能预览 ---
@@ -793,7 +813,7 @@ if [[ "$CLEAN_MODE" != "no" ]]; then
             fi
             printf "\033[35m╰─\033[0m ${MSG[CLEAN_ASK_PROMPT]}"
             read -r answer || answer="n"
-            case "$answer" in
+            case "${answer:-Y}" in
                 y|Y|yes|YES) DO_CLEAN=true; break ;;
                 m|M) if [[ "$AI_LOADED" == true ]]; then ai_select_interactive || true; AI_SPEC=""; AI_MODEL_OVERRIDE=""; fi ;;
                 *) break ;;

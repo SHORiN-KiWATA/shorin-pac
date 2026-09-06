@@ -8,11 +8,10 @@ Simple fzf-based TUI to install and remove pacman, AUR and Flatpak packages on A
 
 ```
 paru -S shorin-pac-git      # 或 yay -S shorin-pac-git
-shorin-pac link             # 把 pac / pacr 链接到 ~/.local/bin
-shorin-pac config           # 选择 AI 供应商和模型（可选）
+pac config                  # 选择 AI 供应商和模型（可选，不配也能用本机 CLI 或公共 key）
 ```
 
-`shorin-pac link` 之后可以直接输入 `pac` 安装、`pacr` 卸载。不想链接的话也可以用 `shorin-pac pac` / `shorin-pac pacr`。
+装好就是两个命令：`pac` 安装、`pacr` 卸载。
 
 ## 命令 / Commands
 
@@ -23,8 +22,7 @@ shorin-pac config           # 选择 AI 供应商和模型（可选）
 | `pacr [关键词]` | 模糊搜索并卸载 pacman / AUR / Flatpak 包；回车后询问是否用 AI 检测家目录残留，fzf 里按 Alt+C 直接“卸载并清残留” |
 | `pacr --scan [关键词]` | 只检测并列出残留，不卸载不删除 |
 | `pacr --clean` / `--no-clean` / `--rm` | 不询问直接检测 / 跳过检测 / 残留直接删除而不是进回收站 |
-| `shorin-pac config` | 配置 AI 供应商和模型（菜单）；也有 `select` / `show` / `set` / `add` / `remove` / `test` 子命令 |
-| `shorin-pac link` / `unlink` | 管理 `~/.local/bin` 中的 `pac` / `pacr` 链接 |
+| `pac config` | 配置 AI 供应商和模型（菜单）；也有 `select` / `show` / `set` / `add` / `remove` / `test` 子命令 |
 
 ## 残留清理是怎么做的 / How leftover cleanup works
 
@@ -42,7 +40,7 @@ AI 只负责“看证据、给结论”：pac 自己收集 PKGBUILD、`.install`
 
 | 供应商 | 说明 |
 |---|---|
-| 自定义 HTTP | 任何 OpenAI Chat Completions 兼容端点（DeepSeek、智谱、OpenRouter、Ollama…）或 Anthropic Messages 端点，在 `shorin-pac config` 里添加 |
+| 自定义 HTTP | OpenAI Chat Completions 兼容端点（DeepSeek、智谱、OpenRouter、Ollama…）、OpenAI Responses 端点或 Anthropic Messages 端点，在 `pac config` 里添加 |
 | `claude-code` | 本机 `claude` CLI，走 Claude 订阅额度 |
 | `codex` | 本机 `codex` CLI |
 | `antigravity` | 本机 `agy` CLI |
@@ -50,17 +48,17 @@ AI 只负责“看证据、给结论”：pac 自己收集 PKGBUILD、`.install`
 | `miyu` | 本机 [Miyu](https://github.com/SHORiN-KiWATA/Miyu)，交给 Miyu 当前的模型路由 |
 | `public` | opencode zen 公共 key（免配置，但额度很小，常被限流，只作兜底） |
 
-本机 CLI 后端默认允许模型使用只读工具（读构建目录、查 AUR RPC、搜索）补充查证，可以在 `shorin-pac config` 里关闭。
+本机 CLI 后端允许模型使用只读工具（读构建目录、查 AUR RPC、搜索）补充查证；`pac config tools off` 可以关闭。
 
-选择顺序：`--ai <供应商[:模型]>` 参数 > 环境变量 `SHORIN_PAC_AI` > `shorin-pac config` 里的选择 > 自动探测（opencode → claude → codex → agy → miyu → public）。
+选择顺序：`--ai <供应商[:模型]>` 参数 > 环境变量 `SHORIN_PAC_AI` > `pac config` 里的选择 > 自动探测（opencode → claude → codex → agy → miyu → public）。
 
 ### 与 Miyu 互通
 
-装了 Miyu 的话，`~/.miyu/config/config.jsonc` 里的供应商和模型会以 `miyu/<id>` 的名字出现在选择列表里（含 API key、Claude Code / Antigravity / Codex 中转线），shorin-pac 只读不写。不想导入可以在 `shorin-pac config` 里关掉。
+装了 Miyu 的话，`~/.miyu/config/config.jsonc` 里的供应商和模型会以 `miyu/<id>` 的名字出现在选择列表里（含 API key、Claude Code / Antigravity / Codex 中转线），shorin-pac 只读不写。不想导入可以用 `pac config miyu off` 关掉。
 
 ## 与 shorin-contrib 的关系 / Relationship to shorin-contrib
 
-这三个脚本原本在 [shorin-contrib](https://github.com/SHORiN-KiWATA/shorin-contrib) 里。现在 `shorin-contrib` 依赖 `shorin-pac`，`shorin pac`、`shorin pacr`、`shorin link` 会自动转交给 `shorin-pac`，老用法不受影响。
+这几个脚本原本在 [shorin-contrib](https://github.com/SHORiN-KiWATA/shorin-contrib) 里。现在 `shorin-contrib` 依赖 `shorin-pac`，`shorin pac`、`shorin pacr` 会转交给全局的 `pac` / `pacr`，`shorin pacrrr` 转到 `pacr --clean`，老用法不受影响。之前用 `shorin link` 在 `~/.local/bin` 里建的 `pac` / `pacr` 链接会失效并遮住新命令，重跑一次 `shorin link` 会自动清理。
 
 ## 配置与缓存 / Paths
 
