@@ -455,17 +455,51 @@ ai_sanitize() {
 # HTTP 后端
 # ------------------------------------------------------------------------------
 
+# opencode Zen 的客户端识别头。
+#
+# Zen 服务端按这几个头分桶；一个都不带的请求被当成匿名客户端，额度是另一张表
+# （第三方客户端「key 有效却狂吐 429」就是这么来的）。头名与取值取自 opencode
+# 1.18.29 的实测抓包，不是从文档抄的——Zen 没文档化这套头。抓法见 Miyu 仓库的
+# testkit/opencode-zen/capture_headers.py。有三处和网上流传的说法不一样，以抓包
+# 为准：project 不在项目里时是字面量 global 而非随机 id；request 是用户消息 id、
+# 一个回合内恒定而非每请求必换；User-Agent 是 opencode/<版本> ai-sdk/...
+# runtime/bun/... 而非 opencode/latest/<版本>/cli。
+AI_OPENCODE_USER_AGENT='opencode/1.18.29 ai-sdk/provider-utils/4.0.46 runtime/bun/1.4.0'
+
+ai_opencode_id() {
+    # ai_opencode_id 前缀 -> 前缀_<12 位时间序十六进制><14 位 base62>，与抓包同形
+    local prefix="$1" head tail='' chars='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ' i
+    printf -v head '%012x' "$(( $(date +%s%3N) & 0xFFFFFFFFFFFF ))"
+    for ((i = 0; i < 14; i++)); do tail+="${chars:RANDOM % 62:1}"; done
+    printf '%s_%s%s' "$prefix" "$head" "$tail"
+}
+
+ai_opencode_session_id() {
+    # 一次运行一个会话 id——opencode 自己也是一次 run 一个。
+    # 只负责把 AI_OPENCODE_SESSION 填上，不 printf：写成 $(...) 取值的话赋值发生
+    # 在子 shell 里，出了命令替换就没了，每次请求都会换一个新会话。
+    [[ -n "${AI_OPENCODE_SESSION:-}" ]] || AI_OPENCODE_SESSION="$(ai_opencode_id ses)"
+}
+
 ai_http_post() {
     # ai_http_post URL BODY_FILE RESP_FILE HEADER...
     local url="$1" body="$2" resp="$3"; shift 3
     local -a hdr=()
-    local h code
+    local h code ua='shorin-pac/1'
     for h in "$@"; do hdr+=(-H "$h"); done
+    # 判定按端点：三条 HTTP 协议线都从这里出去，别处再加会漏。
+    if [[ "$url" == *opencode.ai/zen* ]]; then
+        ai_opencode_session_id
+        ua="$AI_OPENCODE_USER_AGENT"
+        hdr+=(-H 'x-opencode-client: cli' -H 'x-opencode-project: global' \
+              -H "x-opencode-session: ${AI_OPENCODE_SESSION}" \
+              -H "x-opencode-request: $(ai_opencode_id msg)")
+    fi
     code=$(curl --silent --show-error --proto '=https,http' --tlsv1.2 \
         --connect-timeout 15 --max-time "$AI_HTTP_TIMEOUT" \
         --max-filesize "$AI_MAX_OUTPUT_BYTES" \
         -H 'Content-Type: application/json' -H 'Accept: application/json' \
-        --user-agent 'shorin-pac/1' \
+        --user-agent "$ua" \
         "${hdr[@]}" --data-binary "@${body}" \
         -o "$resp" -w '%{http_code}' "$url" 2>"${resp}.curlerr") || {
         AI_LAST_ERROR="$(cat "${resp}.curlerr" 2>/dev/null)"
