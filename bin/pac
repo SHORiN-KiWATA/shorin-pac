@@ -87,6 +87,9 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/shorin-pac"
 LEGACY_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/pac_tui"
 REVIEW_MAX_FILES=128
 REVIEW_MAX_GIT_HISTORY_BYTES=$((64 * 1024))
+# 终端里最多显示多少行 Git 历史。送给 AI 的证据始终是完整的 128 条，
+# 这个上限只影响屏幕观感 —— 一个几百次提交的包会把整屏刷掉。
+REVIEW_TERMINAL_GIT_LINES=10
 REVIEW_MAX_FILE_BYTES=$((128 * 1024))
 REVIEW_MAX_TOTAL_BYTES=$((512 * 1024))
 REVIEW_MAX_DOSSIER_BYTES=$((1024 * 1024))
@@ -193,6 +196,7 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[REVIEW_ASK_BODY]="检测到 AUR 包：%s"
     MSG[REVIEW_ASK_HINT]="AUR 包由用户维护，可能存在风险，建议审查；输入 m 更换 AI 供应商/模型。"
     MSG[REVIEW_MODEL]="当前 AI：%s"
+    MSG[REVIEW_OUTPUT_TRUNCATED]="…… 另有 %s 行未在终端显示（完整内容已提交 AI 审查）"
     MSG[REVIEW_ASK_PROMPT]="进行审查? [Y/n/m] "
     MSG[AI_UNAVAILABLE]="AI 审查不可用（未找到可用供应商）。运行 pac config 配置，或安装 claude / codex / agy / opencode / miyu 之一。"
     MSG[AI_UNAVAILABLE_SHORT]="AI 审查不可用，无法审查此包。"
@@ -257,6 +261,7 @@ else
     MSG[REVIEW_ASK_BODY]="AUR package detected: %s"
     MSG[REVIEW_ASK_HINT]="AUR packages are user-maintained and may be risky; review is recommended; enter m to change the AI provider/model."
     MSG[REVIEW_MODEL]="Current AI: %s"
+    MSG[REVIEW_OUTPUT_TRUNCATED]="... %s more lines not shown here (the full content was sent for review)"
     MSG[REVIEW_ASK_PROMPT]="Run review? [Y/n/m] "
     MSG[AI_UNAVAILABLE]="AI review unavailable (no usable provider). Run 'pac config', or install one of claude / codex / agy / opencode / miyu."
     MSG[AI_UNAVAILABLE_SHORT]="AI review unavailable; this package cannot be reviewed."
@@ -468,6 +473,23 @@ collect_aur_git_history() {
     fi
 }
 
+cap_terminal_lines() {
+    # cap_terminal_lines MAX < 文本：终端只显示前 MAX 行，剩下的折叠成一行提示。
+    # 只作用于屏幕输出；dossier 里给 AI 的内容不经过这里，始终是完整的。
+    local max="$1" shown=0 extra=0 line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if (( shown < max )); then
+            printf '%s\n' "$line"
+            shown=$((shown + 1))
+        else
+            extra=$((extra + 1))
+        fi
+    done
+    if (( extra > 0 )); then
+        printf "${MSG[REVIEW_OUTPUT_TRUNCATED]}\n" "$extra"
+    fi
+}
+
 sanitize_terminal_output() {
     local line
 
@@ -552,7 +574,8 @@ build_review_dossier() {
 
     printf '$ git log --max-count=128 --format=<commit/time/author/subject> -- .\n'
     git_history=$(collect_aur_git_history "$build_dir")
-    printf '%s\n' "$git_history" | sanitize_terminal_output | sed "s/^/${gray}/; s/\$/${reset}/"
+    printf '%s\n' "$git_history" | cap_terminal_lines "$REVIEW_TERMINAL_GIT_LINES" \
+        | sanitize_terminal_output | sed "s/^/${gray}/; s/\$/${reset}/"
     printf '\n'
 
 
