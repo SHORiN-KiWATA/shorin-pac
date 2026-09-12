@@ -121,8 +121,10 @@ ai_init() {
     if [[ ! -s "$AI_CONFIG_FILE" ]]; then
         ai_config_write '{"version":1,"selected":{"provider":"","model":""},"allow_tools":true,"import_miyu":true,"providers":[]}'
     fi
-    AI_ALLOW_TOOLS=$(ai_config_get '.allow_tools // true')
-    AI_IMPORT_MIYU=$(ai_config_get '.import_miyu // true')
+    # jq 的 // 把 false 也当成“缺省”，所以布尔项不能用它取默认值：
+    # `false // true` 会得到 true，用户显式关掉的开关会被静默忽略。
+    AI_ALLOW_TOOLS=$(ai_config_get '.allow_tools | if . == null then true else . end')
+    AI_IMPORT_MIYU=$(ai_config_get '.import_miyu | if . == null then true else . end')
     return 0
 }
 
@@ -221,7 +223,7 @@ ai_miyu_providers() {
     printf '%s' "$json" | jq -c '
         . as $root
         | .providers[]?
-        | select((.enabled // true) == true)
+        | select((.enabled | if . == null then true else . end) == true)
         | (.protocol // "" | ascii_downcase) as $p
         | . + {
             id: ("miyu/" + .id),
