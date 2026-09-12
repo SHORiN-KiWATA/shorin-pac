@@ -42,6 +42,8 @@ AI_MIYU_CONFIG="${AI_MIYU_HOME}/config/config.jsonc"
 AI_HTTP_TIMEOUT="${SHORIN_PAC_AI_HTTP_TIMEOUT:-600}"
 AI_CLI_TIMEOUT="${SHORIN_PAC_AI_CLI_TIMEOUT:-900}"
 AI_MODELS_CACHE_TTL_MIN=1440
+# 探测失败后的冷却时间：一个坏掉的 CLI 不写缓存，否则每次 pac 都要重跑一遍慢探测
+AI_MODELS_FAIL_TTL_MIN=10
 AI_MAX_OUTPUT_BYTES=$((4 * 1024 * 1024))
 
 AI_PROVIDER_ID=""
@@ -241,14 +243,28 @@ ai_miyu_providers() {
     done
 }
 
+ai_cli_models_fallback() {
+    case "$1" in
+        codex) printf '%s\n' gpt-5.6-terra gpt-5.6-luna gpt-5.5 gpt-5.4-mini ;;
+        antigravity) printf '%s\n' gemini-3.8-flash-high gemini-3.8-flash-medium gemini-3.8-flash-low gemini-3.1-pro-high claude-sonnet-4-6 claude-opus-4-6-thinking gpt-oss-120b-medium ;;
+        opencode) printf '%s\n' opencode/big-pickle opencode/mimo-v2.5-free ;;
+    esac
+}
+
 ai_cli_models() {
     # ai_cli_models <protocol>：本机 CLI 的模型列表，带缓存；失败回退到预置列表
     # 注意：bash 的 local 先展开整行再赋值，所以不能在同一行里引用刚声明的变量
     local proto="$1"
     local cache="${AI_CACHE_DIR}/models-${proto}.txt"
+    local failmark="${AI_CACHE_DIR}/models-${proto}.failed"
     local fresh=""
     if [[ -s "$cache" ]] && [[ -z "$(find "$cache" -mmin +${AI_MODELS_CACHE_TTL_MIN} 2>/dev/null)" ]]; then
         cat "$cache"
+        return 0
+    fi
+    # 上次探测失败且还在冷却期内：直接用回退列表，别再花几秒去问一个显然不通的 CLI
+    if [[ -f "$failmark" ]] && [[ -z "$(find "$failmark" -mmin +${AI_MODELS_FAIL_TTL_MIN} 2>/dev/null)" ]]; then
+        ai_cli_models_fallback "$proto"
         return 0
     fi
     case "$proto" in
@@ -264,37 +280,43 @@ ai_cli_models() {
     esac
     if [[ -n "$fresh" ]]; then
         printf '%s\n' "$fresh" > "$cache"
+        rm -f "$failmark"
         printf '%s\n' "$fresh"
         return 0
     fi
-    case "$proto" in
-        codex) printf '%s\n' gpt-5.6-terra gpt-5.6-luna gpt-5.5 gpt-5.4-mini ;;
-        antigravity) printf '%s\n' gemini-3.8-flash-high gemini-3.8-flash-medium gemini-3.8-flash-low gemini-3.1-pro-high claude-sonnet-4-6 claude-opus-4-6-thinking gpt-oss-120b-medium ;;
-        opencode) printf '%s\n' opencode/big-pickle opencode/mimo-v2.5-free ;;
-    esac
+    : > "$failmark"
+    ai_cli_models_fallback "$proto"
 }
 
 ai_builtin_providers() {
+    # ai_builtin_providers [only_id]
     # 内置：公共 key 永远存在；CLI 后端只在命令存在时出现。
-    jq -cn '{id:"public", source:"builtin", display_name:"OpenCode Zen public key (rate limited)", protocol:"openai-chat",
-             base_url:"https://opencode.ai/zen/v1", api_key:"public", models:["big-pickle","mimo-v2.5-free"], default_model:"big-pickle"}'
-    if command -v claude >/dev/null 2>&1; then
+    #
+    # codex / agy / opencode 的模型列表要真的去问那个 CLI，冷缓存下每个都要几秒。
+    # 传 only_id 时只构造这一个供应商，其余的探测整个跳过 —— 解析一个早就选定的
+    # 供应商不该为用不到的 CLI 买单。不传则是完整枚举（供选择界面用）。
+    local only="${1:-}"
+    if [[ -z "$only" || "$only" == public ]]; then
+        jq -cn '{id:"public", source:"builtin", display_name:"OpenCode Zen public key (rate limited)", protocol:"openai-chat",
+                 base_url:"https://opencode.ai/zen/v1", api_key:"public", models:["big-pickle","mimo-v2.5-free"], default_model:"big-pickle"}'
+    fi
+    if [[ -z "$only" || "$only" == claude-code ]] && command -v claude >/dev/null 2>&1; then
         jq -cn '{id:"claude-code", source:"builtin", display_name:"Claude Code CLI", protocol:"claude-code",
                  models:["sonnet","opus","haiku","fable"], default_model:"sonnet"}'
     fi
-    if command -v codex >/dev/null 2>&1; then
+    if [[ -z "$only" || "$only" == codex ]] && command -v codex >/dev/null 2>&1; then
         jq -cn --argjson m "$(ai_cli_models codex | jq -Rn '[inputs]')" \
             '{id:"codex", source:"builtin", display_name:"Codex CLI", protocol:"codex", models:$m, default_model:($m[0] // "gpt-5.6-terra")}'
     fi
-    if command -v agy >/dev/null 2>&1; then
+    if [[ -z "$only" || "$only" == antigravity ]] && command -v agy >/dev/null 2>&1; then
         jq -cn --argjson m "$(ai_cli_models antigravity | jq -Rn '[inputs]')" \
             '{id:"antigravity", source:"builtin", display_name:"Antigravity CLI (agy)", protocol:"antigravity", models:$m, default_model:($m[0] // "gemini-3.8-flash-high")}'
     fi
-    if command -v opencode >/dev/null 2>&1; then
+    if [[ -z "$only" || "$only" == opencode ]] && command -v opencode >/dev/null 2>&1; then
         jq -cn --argjson m "$(ai_cli_models opencode | jq -Rn '[inputs]')" \
             '{id:"opencode", source:"builtin", display_name:"opencode CLI", protocol:"opencode", models:$m, default_model:($m[0] // "opencode/big-pickle")}'
     fi
-    if command -v miyu >/dev/null 2>&1; then
+    if [[ -z "$only" || "$only" == miyu ]] && command -v miyu >/dev/null 2>&1; then
         jq -cn '{id:"miyu", source:"builtin", display_name:"Miyu (uses Miyu current model)", protocol:"miyu", models:["auto"], default_model:"auto"}'
     fi
 }
@@ -312,8 +334,14 @@ ai_all_providers() {
 
 ai_get_provider() {
     # ai_get_provider <id> → JSON 或失败
+    # 与 ai_all_providers 同样的优先级（用户配置 > Miyu 导入 > 内置），但内置层只构造
+    # 这一个 id，因此不会去探测用不到的 CLI 的模型列表。
     local id="$1" found
-    found=$(ai_all_providers | jq -c --arg id "$id" 'select(.id == $id)' | head -n1)
+    found=$({
+        ai_user_providers
+        ai_miyu_providers
+        ai_builtin_providers "$id" | while IFS= read -r line; do printf '%s\n' "$line" | ai_normalize_provider; done
+    } | jq -c --arg id "$id" 'select(.id == $id)' 2>/dev/null | head -n1)
     [[ -n "$found" ]] || return 1
     printf '%s' "$found"
 }
@@ -360,9 +388,11 @@ ai_provider_binary() {
 # ------------------------------------------------------------------------------
 
 ai_auto_provider_id() {
-    local id
+    # 枚举一次就够：原先每轮循环都重跑一遍 ai_all_providers，最多五次全量枚举
+    local id ids
+    ids=$(ai_all_providers | jq -r '.id' 2>/dev/null)
     for id in opencode claude-code codex antigravity miyu; do
-        if ai_all_providers | jq -e --arg id "$id" 'select(.id == $id)' >/dev/null 2>&1; then
+        if grep -qxF -- "$id" <<< "$ids"; then
             printf '%s' "$id"
             return 0
         fi
