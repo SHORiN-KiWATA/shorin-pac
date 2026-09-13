@@ -398,7 +398,7 @@ AWK_PREVIEW='{
 }'
 
 # 必须在 fzf 子进程内独立执行 export LC_ALL，防止被全局 C 环境干扰导致不认中文冒号
-PREVIEW_CMD="export LC_ALL=\"$ORIGINAL_LANG\"; $AUR_HELPER --color=always -Si {2} | awk -v c=\"$(printf '\033[1;36m')\" -v r=\"$(printf '\033[0m')\" '$AWK_PREVIEW'"
+PREVIEW_CMD="export LC_ALL=\"$ORIGINAL_LANG\"; $AUR_HELPER --color=always -Si {1}/{2} | awk -v c=\"$(printf '\033[1;36m')\" -v r=\"$(printf '\033[0m')\" '$AWK_PREVIEW'"
 
 aur_build_dir() {
     local pkg="$1"
@@ -419,11 +419,7 @@ fetch_aur_build_files() {
     rm -rf -- "$build_root"
     mkdir -p "$build_root"
 
-    if [[ "$AUR_HELPER" == "paru" ]]; then
-        (cd "$build_root" && LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" --aur --redownload -G "$pkg")
-    else
-        (cd "$build_root" && LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" --aur --redownload -G "$pkg")
-    fi
+    (cd "$build_root" && LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" --redownload -G "aur/$pkg")
 
     shopt -s nullglob
     pkgbuilds=("$build_root"/PKGBUILD "$build_root"/*/PKGBUILD)
@@ -541,8 +537,8 @@ build_review_dossier() {
     printf '%s\n' "$directory_listing" | sanitize_terminal_output | sed "s/^/${gray}/; s/\$/${reset}/"
     printf '\n'
 
-    printf '$ %q --aur -Si %q 2>&1\n' "$AUR_HELPER" "$pkg"
-    if ! helper_info=$(NO_COLOR=1 LC_ALL=C "$AUR_HELPER" --aur -Si "$pkg" 2>&1); then
+    printf '$ %q -Si %q 2>&1\n' "$AUR_HELPER" "aur/$pkg"
+    if ! helper_info=$(NO_COLOR=1 LC_ALL=C "$AUR_HELPER" -Si "aur/$pkg" 2>&1); then
         echo "${MSG[ERR_REVIEW_METADATA]}" >&2
         return 1
     fi
@@ -1043,11 +1039,11 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
             fi
             echo -e "\033[36m${MSG[CHECK_DONE]}\033[0m"
         elif [[ ${#AUR_REVIEWED[@]} -gt 0 ]]; then
-            AUR_INSTALL_ARGS=(-Sa --noconfirm)
+            AUR_INSTALL_ARGS=(-S --noconfirm)
             if [[ "$AUR_HELPER" == "paru" ]]; then
                 AUR_INSTALL_ARGS+=(--skipreview)
             fi
-            AUR_INSTALL_ARGS+=("${AUR_REVIEWED[@]}")
+            AUR_INSTALL_ARGS+=("${AUR_REVIEWED[@]/#/aur/}")
             FINAL_CMD="$AUR_HELPER ${AUR_INSTALL_ARGS[*]}"
 
             echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
@@ -1063,11 +1059,11 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
         fi
 
         if [[ ${#AUR_UNREVIEWED[@]} -gt 0 ]]; then
-            AUR_INSTALL_ARGS=(-Sa)
+            AUR_INSTALL_ARGS=(-S)
             if [[ "$AUR_HELPER" == "paru" ]]; then
                 AUR_INSTALL_ARGS+=(--skipreview)
             fi
-            AUR_INSTALL_ARGS+=("${AUR_UNREVIEWED[@]}")
+            AUR_INSTALL_ARGS+=("${AUR_UNREVIEWED[@]/#/aur/}")
             FINAL_CMD="$AUR_HELPER ${AUR_INSTALL_ARGS[*]}"
 
             echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"

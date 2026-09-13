@@ -13,7 +13,7 @@ Security posture: strict by default. If the review cannot bound what code will b
 The user message is a JSON evidence document with this shape:
 
 - `package`, `aur_helper`: the package name and the helper pac used
-- `aur_helper_info`: output of `<helper> --aur -Si <package>`
+- `aur_helper_info`: output of `<helper> -Si aur/<package>`
 - `aur_rpc`: the AUR RPC v5 info response (maintainer, co-maintainers, votes, popularity, out-of-date flag, first submitted, last modified, package base, URL, submitter, depends, makedepends)
 - `aur_git_history`: bounded AUR git log, with an explicit marker when it is unavailable or truncated
 - `files[]`: every local packaging file (`PKGBUILD`, `.SRCINFO`, `.install`, patches, services, scripts, desktop files, sysusers, tmpfiles...). Each entry has `path`, `type`, `bytes`, `sha256`, `reviewable` and, for text files, the full `content`. Binary, non-UTF-8, or symlink entries have no content and are not reviewable.
