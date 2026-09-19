@@ -275,7 +275,8 @@ ai_cli_models() {
             fresh=$(timeout 20 agy models 2>/dev/null | awk -F'\t' 'NF >= 1 && $1 !~ /^Fetching/ && $1 != "" { print $1 }' || true)
             ;;
         opencode)
-            fresh=$(timeout 20 opencode models 2>/dev/null | awk 'NF { print $1 }' || true)
+            # --standalone 的说明见 ai_cli_opencode；models 一样会去碰后台服务
+            fresh=$(timeout 20 opencode models --standalone 2>/dev/null | awk 'NF { print $1 }' || true)
             ;;
     esac
     if [[ -n "$fresh" ]]; then
@@ -725,8 +726,16 @@ ai_cli_opencode() {
     bin=$(ai_provider_binary "$AI_PROVIDER_JSON")
     command -v "$bin" >/dev/null 2>&1 || { echo "$(ai_msg ERR_BINARY) $bin" >&2; return 1; }
     log="${out}.log"; : > "$log"
+    # 按 opencode 2.x 的命令行来：run 没有了 --pure / --dir，换成 --standalone —— 起一个
+    # 随进程退出的私有 server，不去连、也不拉起那个常驻的后台服务。
+    # 1.x 不认识 --standalone，但它的解析器会忽略不认识的旗标，且不给 --dir 时本来就取
+    # cwd（ai_cli_run 已经 cd 过去了），所以这一条命令两代通吃。代价是 1.x 上少了 --pure，
+    # 用户装的 opencode 插件会跟着加载 —— 2.x 压根没有这个开关，早晚都得接受。
+    #
+    # 下面这几个开关只对「由这次调用拉起的 server」生效：2.x 连上一个别人早就起好的
+    # 后台服务时它们是不算数的，这也是要 --standalone 的另一个原因。
     OPENCODE_DISABLE_PROJECT_CONFIG=1 OPENCODE_DISABLE_CLAUDE_CODE=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 \
-    ai_cli_run "$log" "$workdir" "$bin" run --pure -m "$AI_MODEL" --dir "$workdir" \
+    ai_cli_run "$log" "$workdir" "$bin" run --standalone -m "$AI_MODEL" \
         < <(cat "$sys"; printf '\n\n---\n\n'; cat "$user") | ai_sanitize > "$out" || ai_cli_fail "$log"
     [[ -s "$out" ]] || ai_cli_fail "$log"
 }
