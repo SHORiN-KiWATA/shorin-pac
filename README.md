@@ -50,6 +50,8 @@ AI 只负责“看证据、给结论”：pac 自己收集 PKGBUILD、`.install`
 
 本机 CLI 后端允许模型使用只读工具（读构建目录、查 AUR RPC、搜索）补充查证；`pac config tools off` 可以关闭。
 
+opencode zen 从 09-19 起给免费模型加了一道「只能从 OpenCode 里用」的闸，第三方客户端一律 `403 · OpenCode's free tier can only be used from within OpenCode`。实测判据是请求得长得像 opencode 发的：流式、工具清单里有 `shell` 和 `read`、带 `x-opencode-*` 头。所以发往 `opencode.ai/zen` 的请求（`public` 兜底和自己配的 zen 节点）会自动改成这个形状——流式，外加两条永不调用的占位工具声明，HTTP 后端本身仍然不开工具。其他端点一个字节都不动。这是对面服务端的策略，他们随时可能改判据。
+
 选择顺序：`--ai <供应商[:模型]>` 参数 > 环境变量 `SHORIN_PAC_AI` > `pac config` 里的选择 > 自动探测（opencode → claude → codex → agy → miyu → public）。
 
 ### 与 Miyu 互通

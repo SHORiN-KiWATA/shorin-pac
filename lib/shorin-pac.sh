@@ -499,6 +499,15 @@ ai_sanitize() {
 # runtime/bun/... 而非 opencode/latest/<版本>/cli。
 AI_OPENCODE_USER_AGENT='opencode/1.18.29 ai-sdk/provider-utils/4.0.46 runtime/bun/1.4.0'
 
+ai_is_zen_endpoint() {
+    # 判定按端点而不是供应商 id：那份配置用户可以改名（配置界面里加的节点自己起
+    # 名字），决定服务端怎么看这次请求的是打到哪个地址。端点不止 /zen/v1 一个——
+    # Console Go 挂在 /zen/go/v1，同一套网关——所以按 /zen 这一层整段判，新开的
+    # 兄弟端点自动覆盖到。只认整段：/zenith/v1 这种不算。
+    local url="${1%/}"
+    [[ "$url" == "https://opencode.ai/zen" || "$url" == https://opencode.ai/zen/* ]]
+}
+
 ai_opencode_id() {
     # ai_opencode_id 前缀 -> 前缀_<12 位时间序十六进制><14 位 base62>，与抓包同形
     local prefix="$1" head tail='' chars='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ' i
@@ -521,7 +530,7 @@ ai_http_post() {
     local h code ua='shorin-pac/1'
     for h in "$@"; do hdr+=(-H "$h"); done
     # 判定按端点：三条 HTTP 协议线都从这里出去，别处再加会漏。
-    if [[ "$url" == *opencode.ai/zen* ]]; then
+    if ai_is_zen_endpoint "$url"; then
         ai_opencode_session_id
         ua="$AI_OPENCODE_USER_AGENT"
         hdr+=(-H 'x-opencode-client: cli' -H 'x-opencode-project: global' \
@@ -531,7 +540,7 @@ ai_http_post() {
     code=$(curl --silent --show-error --proto '=https,http' --tlsv1.2 \
         --connect-timeout 15 --max-time "$AI_HTTP_TIMEOUT" \
         --max-filesize "$AI_MAX_OUTPUT_BYTES" \
-        -H 'Content-Type: application/json' -H 'Accept: application/json' \
+        -H 'Content-Type: application/json' -H "Accept: ${AI_HTTP_ACCEPT:-application/json}" \
         --user-agent "$ua" \
         "${hdr[@]}" --data-binary "@${body}" \
         -o "$resp" -w '%{http_code}' "$url" 2>"${resp}.curlerr") || {
@@ -542,6 +551,56 @@ ai_http_post() {
     [[ "$code" =~ ^2 ]]
 }
 
+# ------------------------------------------------------------------------------
+# opencode Zen 免费档的客户端识别：请求体里的工具名
+#
+# 09-19 起 Zen 对免费模型（big-pickle、mimo-v2.5-free 这类 -free 型号）加了一道
+# 闸，第三方客户端一律
+# `403 FreeTierError: OpenCode's free tier can only be used from within OpenCode`。
+# 09-20 对真端点做了上百次对照实验（脚本在 Miyu 仓库的
+# testkit/opencode-zen/freetier_probe.js），判据是**三件同时成立**：
+#
+#     stream: true
+#     tools 里同时有 (shell 或 bash) 和 read
+#     至少带一个 x-opencode-* 头（ai_http_post 那半已经在发了）
+#
+# 三条缺一不可，而且是合取——这也是排查时踩的坑：先去掉头、body 也不合格，于是
+# 误判成「头不相干」；实际单独去掉任一个 x-opencode-* 头都还能过，一个都不带才挡。
+#
+# 逐条实测过、确认不参与判定的：User-Agent 的具体内容（完全不带 UA 才挡）、key 是
+# 真 key 还是字面量 public、body 大小、system 提示词、工具的 description 与
+# parameters（全清空照样 200）、tools 里额外挂多少件自造工具。
+#
+# 09-20 移植到 shorin-pac 时另测出来一条 Miyu 那份笔记里没有的：**x-opencode-session
+# 的取值本身也参与判定**，必须是 `ses_` + 12 位十六进制 + 14 位 base62 这个形状，
+# 多一位少一位、或者头 12 位不是十六进制，照样 403 FreeTierError（`ses_notanid`
+# 也挡）。Miyu 的探针一直在生成合规 id，所以没变过这个量、也就没测出来。
+# 也就是说下面 ai_opencode_id 那 12+14 位不是装饰，改坏了整条 HTTP 线就废，别动。
+#
+# shorin-pac 的 HTTP 线本来就不开工具（ai_backend_has_tools 对 HTTP 后端返回假），
+# 所以补的是两条占位声明：名字对上就放行。描述里写明了不要调用；万一模型真回了
+# tool_calls，这一轮正文为空，按 ERR_EMPTY 收场，不会执行任何东西。
+#
+# ⚠️ 这是 opencode 服务端的策略，他们随时可能改判据。Zen 的免费模型重新开始报
+# 403 的话，跑一遍上面那个探针看是哪一条变了，别靠猜。
+# ------------------------------------------------------------------------------
+
+# shell 与 read 是实测出来的最小通过集：两个都在才放行，只留一个就挡（只有 shell
+# 403、只有 read 也 403）。bash 与 shell 等价，选 shell 是因为官方客户端报的就是它。
+ai_zen_tools_json() {
+    jq -cn '["shell","read"] | map({type:"function", function:{
+        name:., description:"Compatibility placeholder. Never call this tool.",
+        parameters:{type:"object", properties:{}}}})'
+}
+
+ai_zen_stream_text() {
+    # SSE 拼回正文：data: 行逐行 fromjson，取 delta.content 接起来。
+    # -R + fromjson? 而不是直接喂 jq：[DONE] 和半截帧解析失败时跳过，不会把整段
+    # 正文一起丢掉。usage 帧的 choices 是空数组，.choices[0] 取到 null，往下索引
+    # 在 jq 里仍是 null，落到 empty，不报错。
+    sed -n 's/^data: *//p' "$1" | jq -j -R 'fromjson? | .choices[0].delta.content // empty' 2>/dev/null
+}
+
 ai_http_error_message() {
     # 从响应体里抠错误信息
     local resp="$1"
@@ -550,14 +609,26 @@ ai_http_error_message() {
 
 ai_http_openai() {
     local sys="$1" user="$2" out="$3"
-    local base key url body resp msg
+    local base key url body resp msg zen=0
     base=$(jq -r '.base_url' <<< "$AI_PROVIDER_JSON")
     key=$(ai_resolve_key "$(jq -r '.api_key' <<< "$AI_PROVIDER_JSON")")
-    [[ -n "$key" ]] || { [[ "$base" == *opencode.ai/zen* ]] && key="public"; }
+    [[ -n "$key" ]] || { ai_is_zen_endpoint "$base" && key="public"; }
     [[ -n "$key" ]] || { echo "$(ai_msg ERR_NO_KEY) $AI_PROVIDER_ID" >&2; return 1; }
     body="${out}.req"; resp="${out}.resp"
-    jq -n --arg model "$AI_MODEL" --rawfile sys "$sys" --rawfile user "$user" \
-        '{model:$model, stream:false, messages:[{role:"system",content:$sys},{role:"user",content:$user}]}' > "$body"
+    if ai_is_zen_endpoint "$base"; then
+        # 免费档那道闸里属于 body 的两件，见上面那段注释。流式下用量不在这条线上
+        # 用，但 stream_options 照给——不点名要就连最后一帧都没有，日后要统计时
+        # 不用再改请求。
+        zen=1
+        jq -n --arg model "$AI_MODEL" --rawfile sys "$sys" --rawfile user "$user" \
+            --argjson tools "$(ai_zen_tools_json)" \
+            '{model:$model, stream:true, stream_options:{include_usage:true}, tools:$tools,
+              messages:[{role:"system",content:$sys},{role:"user",content:$user}]}' > "$body"
+        local AI_HTTP_ACCEPT='text/event-stream'
+    else
+        jq -n --arg model "$AI_MODEL" --rawfile sys "$sys" --rawfile user "$user" \
+            '{model:$model, stream:false, messages:[{role:"system",content:$sys},{role:"user",content:$user}]}' > "$body"
+    fi
     url="${base}/chat/completions"
     if ! ai_http_post "$url" "$body" "$resp" "Authorization: Bearer ${key}"; then
         # 有些端点要 /v1 前缀，有些不要：404 时换一种再试
@@ -569,7 +640,11 @@ ai_http_openai() {
             ai_http_report_failure "$resp"; return 1
         fi
     fi
-    jq -r '.choices[0].message.content // empty' "$resp" 2>/dev/null | ai_sanitize > "$out"
+    if (( zen )); then
+        ai_zen_stream_text "$resp" | ai_sanitize > "$out"
+    else
+        jq -r '.choices[0].message.content // empty' "$resp" 2>/dev/null | ai_sanitize > "$out"
+    fi
     rm -f "$body" "$resp" "${resp}.curlerr"
     [[ -s "$out" ]] || { echo "$(ai_msg ERR_EMPTY)" >&2; return 1; }
 }
