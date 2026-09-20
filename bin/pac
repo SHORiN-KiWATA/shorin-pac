@@ -81,6 +81,7 @@ SHOW_HELP=false
 FORCE_REFRESH=false
 CHECK_ONLY=false
 QUERY_ARGS=()
+NO_AI=false            # --no-ai：本次不碰 AI，等价于把 pac config 里的总开关临时关掉
 AI_SPEC=""             # --ai <provider[:model]>，也可用环境变量 SHORIN_PAC_AI
 AI_MODEL_OVERRIDE=""   # --ai-model <model>：只换当前供应商下的模型
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/shorin-pac"
@@ -133,6 +134,10 @@ while [[ $# -gt 0 ]]; do
             CHECK_ONLY=true
             shift
             ;;
+        --no-ai)
+            NO_AI=true
+            shift
+            ;;
         --ai)
             if [[ -z "${2:-}" ]]; then
                 echo "Error: --ai requires <provider[:model]>." >&2
@@ -156,6 +161,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# --check 就是「只做 AI 审查」，--no-ai 把审查关掉，两个一起给等于什么都不做
+if [[ "$CHECK_ONLY" == true && "$NO_AI" == true ]]; then
+    echo "Error: --check and --no-ai contradict each other." >&2
+    exit 1
+fi
+
 # --- 3. 本地化多语言字典 (使用安全的关联数组) ---
 declare -A MSG
 if [[ "$IS_CHINESE_LOCALE" == true ]]; then
@@ -166,6 +177,7 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[OPT_CHECK]="  --check, -c   仅审查 AUR 包，不安装"
     MSG[OPT_AI]="  --ai <供应商[:模型]>  本次使用指定的 AI 供应商/模型 (例：--ai claude-code:sonnet)"
     MSG[OPT_AI_MODEL]="  --ai-model <模型>     只更换当前供应商下的模型"
+    MSG[OPT_NO_AI]="  --no-ai       本次关闭 AI：不审查 AUR，直接安装（持久关闭用 pac config ai off）"
     MSG[OPT_CONFIG]="  config [子命令]       配置 AI 供应商与模型（pac config --help 查看子命令）"
     MSG[ENV]="环境变量："
     MSG[ENV_AI]="  SHORIN_PAC_AI=<供应商[:模型]>  等价于 --ai；持久配置请用 pac config"
@@ -200,6 +212,8 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[REVIEW_ASK_PROMPT]="进行审查? [Y/n/m] "
     MSG[AI_UNAVAILABLE]="AI 审查不可用（未找到可用供应商）。运行 pac config 配置，或安装 claude / codex / agy / opencode / miyu 之一。"
     MSG[AI_UNAVAILABLE_SHORT]="AI 审查不可用，无法审查此包。"
+    MSG[AI_OFF]="AI 功能已关闭，跳过 AUR 审查直接安装。"
+    MSG[AI_OFF_CHECK]="AI 功能已关闭（pac config ai on 可重新打开），--check 无事可做。"
     MSG[REVIEW_ASK_PROMPT_NOAI]="不审查直接安装? [y/N] "
     MSG[INSTALL_RISK_LOW]="🟢低风险"
     MSG[INSTALL_RISK_MEDIUM]="🟡中风险"
@@ -231,6 +245,7 @@ else
     MSG[OPT_CHECK]="  --check, -c   Review AUR packages only; do not install"
     MSG[OPT_AI]="  --ai <provider[:model]>  Use this AI provider/model for this run (e.g. --ai claude-code:sonnet)"
     MSG[OPT_AI_MODEL]="  --ai-model <model>       Only switch the model of the current provider"
+    MSG[OPT_NO_AI]="  --no-ai       Disable AI for this run: install AUR packages without review (persist with 'pac config ai off')"
     MSG[OPT_CONFIG]="  config [subcommand]      Configure the AI provider and model (pac config --help)"
     MSG[ENV]="Environment:"
     MSG[ENV_AI]="  SHORIN_PAC_AI=<provider[:model]>  Same as --ai; use 'pac config' for a persistent choice"
@@ -265,6 +280,8 @@ else
     MSG[REVIEW_ASK_PROMPT]="Run review? [Y/n/m] "
     MSG[AI_UNAVAILABLE]="AI review unavailable (no usable provider). Run 'pac config', or install one of claude / codex / agy / opencode / miyu."
     MSG[AI_UNAVAILABLE_SHORT]="AI review unavailable; this package cannot be reviewed."
+    MSG[AI_OFF]="AI features are off; installing AUR packages without review."
+    MSG[AI_OFF_CHECK]="AI features are off ('pac config ai on' re-enables them); --check has nothing to do."
     MSG[REVIEW_ASK_PROMPT_NOAI]="Install without review? [y/N] "
     MSG[INSTALL_RISK_LOW]="🟢Low Risk"
     MSG[INSTALL_RISK_MEDIUM]="🟡Medium Risk"
@@ -301,6 +318,7 @@ ${MSG[OPT_REFRESH]}
 ${MSG[OPT_CHECK]}
 ${MSG[OPT_AI]}
 ${MSG[OPT_AI_MODEL]}
+${MSG[OPT_NO_AI]}
 ${MSG[OPT_CONFIG]}
 
 ${MSG[ENV]}
@@ -706,7 +724,14 @@ build_review_dossier() {
 # --- 6b. AI 审查 ---
 
 load_ai_lib() {
-    # 加载供应商层并解析本次使用的供应商/模型；失败返回 1（AI 不可用）
+    # 加载供应商层并解析本次使用的供应商/模型；失败返回 1。
+    # 失败分两种，调用方要分开处理：AI_OFF=true 是用户自己关的（--no-ai 或
+    # pac config ai off），不算异常，不该报错也不该追问；其余是真的没有可用供应商。
+    AI_OFF=false
+    if [[ "$NO_AI" == true ]]; then
+        AI_OFF=true
+        return 1
+    fi
     if [[ -z "$AI_LIB" ]]; then
         echo "${MSG[ERR_AI_LIB]}" >&2
         return 1
@@ -715,6 +740,10 @@ load_ai_lib() {
     # shellcheck source=/dev/null
     source "$AI_LIB"
     ai_init || return 1
+    if ! ai_enabled; then
+        AI_OFF=true
+        return 1
+    fi
     local spec="$AI_SPEC"
     if [[ -z "$spec" && -n "$AI_MODEL_OVERRIDE" ]]; then
         ai_resolve >/dev/null 2>&1 || return 1
@@ -930,11 +959,26 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
         AUR_UNREVIEWED=()
         REVIEW_FAILURE_COUNT=0
         AI_LOADED=false
+        AI_OFF=false
         if ! load_ai_lib; then
-            echo -e "\033[33m${MSG[AI_UNAVAILABLE]}\033[0m" >&2
+            if [[ "$AI_OFF" == true ]]; then
+                # --check 早在参数解析时就和 --no-ai 互斥了，这里挡的是配置里关掉的情况
+                if [[ "$CHECK_ONLY" == true ]]; then
+                    echo -e "\033[33m${MSG[AI_OFF_CHECK]}\033[0m" >&2
+                    exit 1
+                fi
+                echo -e "\033[90m${MSG[AI_OFF]}\033[0m"
+            else
+                echo -e "\033[33m${MSG[AI_UNAVAILABLE]}\033[0m" >&2
+            fi
         fi
 
         for pkg in "${AUR_PACKAGES[@]}"; do
+            if [[ "$AI_OFF" == true ]]; then
+                # 用户已经明确关掉了审查，每个包再问一遍「不审查直接安装?」是多余的
+                AUR_UNREVIEWED+=("$pkg")
+                continue
+            fi
             if [[ "$CHECK_ONLY" != true ]]; then
                 while true; do
                     answer=""
@@ -1060,7 +1104,10 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
 
         if [[ ${#AUR_UNREVIEWED[@]} -gt 0 ]]; then
             AUR_INSTALL_ARGS=(-S)
-            if [[ "$AUR_HELPER" == "paru" ]]; then
+            # --skipreview 关的是 paru 自己那道 PKGBUILD 复核。AI 审过、或者用户
+            # 当着提示说了「不审查直接装」，关掉它是他自己的选择；但 AI 整个关掉
+            # 时用户只是不想用 AI，没说要连 paru 的复核一起免掉，这时留着。
+            if [[ "$AUR_HELPER" == "paru" && "$AI_OFF" != true ]]; then
                 AUR_INSTALL_ARGS+=(--skipreview)
             fi
             AUR_INSTALL_ARGS+=("${AUR_UNREVIEWED[@]/#/aur/}")

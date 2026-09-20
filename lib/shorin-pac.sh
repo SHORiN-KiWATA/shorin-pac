@@ -18,7 +18,8 @@
 # - 依赖：bash 4+、jq、curl。fzf 只在交互选择时需要。
 #
 # 对外函数（其余均为内部函数）：
-#   ai_init                       初始化路径与配置
+#   ai_init                       初始化路径与配置（顺带把 AI_ENABLED 读出来）
+#   ai_enabled                    AI 功能总开关是否打开（返回码）
 #   ai_all_providers              NDJSON 输出所有可用供应商
 #   ai_resolve [provider:model]   解析当前选择，设置 AI_PROVIDER_ID / AI_MODEL / AI_PROVIDER_JSON
 #   ai_backend_has_tools          当前后端是否可用只读工具（返回码）
@@ -51,6 +52,9 @@ AI_MODEL=""
 AI_PROVIDER_JSON=""
 AI_ALLOW_TOOLS=true
 AI_IMPORT_MIYU=true
+# AI 功能总开关。关掉之后 pac 不再审查 AUR、pacr 不再检测残留，两条命令退回纯粹的
+# 包管理器包装器；配置界面本身不受它约束，否则关掉就没法在界面里打开了。
+AI_ENABLED=true
 AI_LAST_ERROR=""
 AI_HEARTBEAT_PID=""
 
@@ -121,13 +125,21 @@ ai_init() {
     }
     mkdir -p "$AI_CONFIG_DIR" "$AI_CACHE_DIR"
     if [[ ! -s "$AI_CONFIG_FILE" ]]; then
-        ai_config_write '{"version":1,"selected":{"provider":"","model":""},"allow_tools":true,"import_miyu":true,"providers":[]}'
+        ai_config_write '{"version":1,"selected":{"provider":"","model":""},"ai_enabled":true,"allow_tools":true,"import_miyu":true,"providers":[]}'
     fi
     # jq 的 // 把 false 也当成“缺省”，所以布尔项不能用它取默认值：
     # `false // true` 会得到 true，用户显式关掉的开关会被静默忽略。
     AI_ALLOW_TOOLS=$(ai_config_get '.allow_tools | if . == null then true else . end')
     AI_IMPORT_MIYU=$(ai_config_get '.import_miyu | if . == null then true else . end')
+    # 老配置里没有这一项，缺省按开着算——升级不该悄悄把功能关掉
+    AI_ENABLED=$(ai_config_get '.ai_enabled | if . == null then true else . end')
     return 0
+}
+
+ai_enabled() {
+    # AI 功能总开关。pac / pacr 的 --no-ai 是同一个开关的一次性覆盖，见它们的
+    # load_ai_lib；这里只看配置文件。
+    [[ "$AI_ENABLED" == true ]]
 }
 
 ai_config_get() {
@@ -966,8 +978,13 @@ config_msg() {
             M_REMOVE) printf '%s' "删除自定义供应商" ;;
             M_TEST) printf '%s' "测试当前供应商" ;;
             M_SHOW) printf '%s' "查看当前配置" ;;
+            M_AI) printf '%s' "AI 功能总开关" ;;
             M_QUIT) printf '%s' "退出" ;;
             CURRENT) printf '%s' "当前：" ;;
+            ON) printf '%s' "开" ;;
+            OFF) printf '%s' "关" ;;
+            AI_OFF_HINT) printf '%s' "已关闭：pac 不再审查 AUR，pacr 不再检测残留" ;;
+            SHOW_AI) printf '%s' "AI 功能" ;;
             ADD_ID) printf '%s' "供应商 id（字母数字和 - _，例如 deepseek）: " ;;
             ADD_NAME) printf '%s' "显示名称（回车用 id）: " ;;
             ADD_URL) printf '%s' "API 地址（例如 https://api.deepseek.com/v1）: " ;;
@@ -1001,8 +1018,13 @@ config_msg() {
             M_REMOVE) printf '%s' "Remove a custom provider" ;;
             M_TEST) printf '%s' "Test the current provider" ;;
             M_SHOW) printf '%s' "Show current settings" ;;
+            M_AI) printf '%s' "AI features" ;;
             M_QUIT) printf '%s' "Quit" ;;
             CURRENT) printf '%s' "Current:" ;;
+            ON) printf '%s' "on" ;;
+            OFF) printf '%s' "off" ;;
+            AI_OFF_HINT) printf '%s' "off: pac skips AUR review, pacr skips leftover detection" ;;
+            SHOW_AI) printf '%s' "AI features" ;;
             ADD_ID) printf '%s' "Provider id (letters, digits, - _; e.g. deepseek): " ;;
             ADD_NAME) printf '%s' "Display name (Enter = id): " ;;
             ADD_URL) printf '%s' "API base URL (e.g. https://api.deepseek.com/v1): " ;;
@@ -1034,6 +1056,7 @@ config_msg() {
 config_show() {
     local cyan=$'\033[36m' reset=$'\033[0m'
     ai_resolve >/dev/null 2>&1 || true
+    echo "${cyan}$(config_msg SHOW_AI)${reset}: $(ai_enabled && config_msg ON || config_msg OFF)"
     echo "${cyan}$(config_msg SHOW_SELECTED)${reset}: $(ai_describe_selection 2>/dev/null || echo '-')"
     echo "${cyan}$(config_msg SHOW_CUSTOM)${reset}: $(ai_config_get '[.providers[]? | .id + " (" + .protocol + ", " + (.models | join(", ")) + ")"] | join("; ")' | sed "s/^$/$(config_msg SHOW_NONE)/")"
     echo "${cyan}$(config_msg SHOW_CONFIG)${reset}: $AI_CONFIG_FILE"
@@ -1094,11 +1117,12 @@ config_remove() {
 }
 
 config_toggle() {
-    local key="$1" value="$2"
+    # config_toggle 配置键 取值 [子命令名]：子命令名只用来拼用法提示，缺省同键名
+    local key="$1" value="$2" name="${3:-$1}"
     case "$value" in
         on|true|1) value=true ;;
         off|false|0) value=false ;;
-        *) echo "usage: pac config $key on|off" >&2; return 1 ;;
+        *) echo "usage: pac config $name on|off" >&2; return 1 ;;
     esac
     ai_config_update ".${key} = \$v" --argjson v "$value"
     ai_init
@@ -1126,6 +1150,7 @@ config_menu() {
     while true; do
         ai_resolve >/dev/null 2>&1 || true
         choice=$(printf '%s\n' \
+            "ai	$(config_msg M_AI)	$(config_msg CURRENT) $(ai_enabled && config_msg ON || config_msg OFF)" \
             "select	$(config_msg M_SELECT)	$(config_msg CURRENT) $(ai_describe_selection 2>/dev/null || echo -)" \
             "add	$(config_msg M_ADD)	" \
             "remove	$(config_msg M_REMOVE)	" \
@@ -1136,6 +1161,16 @@ config_menu() {
             | fzf --ansi --delimiter='\t' --with-nth=2.. --height=12 --layout=reverse --border --header "$(config_msg MENU_HEADER)" \
             | cut -f1) || return 0
         case "$choice" in
+            ai)
+                # 菜单里就地翻转，翻完把提示打出来——关掉之后两条命令的行为都变了
+                if ai_enabled; then
+                    config_toggle ai_enabled off ai || true
+                    echo -e "\033[33m$(config_msg AI_OFF_HINT)\033[0m"
+                    read -r -p "$(config_msg PRESS_ENTER)" _ || true
+                else
+                    config_toggle ai_enabled on ai || true
+                fi
+                ;;
             select) ai_select_interactive || true ;;
             add) config_add || true ;;
             remove) config_remove || true ;;
@@ -1155,8 +1190,9 @@ config_main() {
         set) [[ -n "${2:-}" ]] || { echo "usage: pac config set <provider[:model]>" >&2; return 1; }; config_set "$2" ;;
         add) config_add ;;
         remove) config_remove "${2:-}" ;;
-        tools) config_toggle allow_tools "${2:-}" ;;
-        miyu) config_toggle import_miyu "${2:-}" ;;
+        ai) config_toggle ai_enabled "${2:-}" ai ;;
+        tools) config_toggle allow_tools "${2:-}" tools ;;
+        miyu) config_toggle import_miyu "${2:-}" miyu ;;
         test) config_test ;;
         path) echo "$AI_CONFIG_FILE" ;;
         -h|--help|help)
@@ -1166,6 +1202,9 @@ pac config select          choose provider and model / 选择供应商与模型
 pac config show            show current settings / 查看当前配置
 pac config set <provider[:model]>
 pac config add | remove [id]
+pac config ai on|off       enable / disable all AI features / AI 功能总开关
+pac config tools on|off    allow read-only tools on CLI backends / CLI 后端只读工具
+pac config miyu on|off     import providers from Miyu / 导入 Miyu 的供应商
 pac config test            send a test message / 发一条测试消息
 pac config path            print the config file path
 EOF

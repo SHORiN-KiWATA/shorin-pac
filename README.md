@@ -22,7 +22,8 @@ pac config                  # 选择 AI 供应商和模型（可选，不配也�
 | `pacr [关键词]` | 模糊搜索并卸载 pacman / AUR / Flatpak 包；回车后询问是否用 AI 检测家目录残留，fzf 里按 Alt+C 直接“卸载并清残留” |
 | `pacr --scan [关键词]` | 只检测并列出残留，不卸载不删除 |
 | `pacr --clean` / `--no-clean` / `--rm` | 不询问直接检测 / 跳过检测 / 残留直接删除而不是进回收站 |
-| `pac config` | 配置 AI 供应商和模型（菜单）；也有 `select` / `show` / `set` / `add` / `remove` / `test` 子命令 |
+| `pac --no-ai` / `pacr --no-ai` | 本次不用 AI，见下面「关掉 AI」 |
+| `pac config` | 配置 AI 供应商和模型（菜单）；也有 `select` / `show` / `set` / `add` / `remove` / `test` / `ai` / `tools` / `miyu` 子命令 |
 
 ## 残留清理是怎么做的 / How leftover cleanup works
 
@@ -53,6 +54,20 @@ AI 只负责“看证据、给结论”：pac 自己收集 PKGBUILD、`.install`
 opencode zen 从 09-19 起给免费模型加了一道「只能从 OpenCode 里用」的闸，第三方客户端一律 `403 · OpenCode's free tier can only be used from within OpenCode`。实测判据是请求得长得像 opencode 发的：流式、工具清单里有 `shell` 和 `read`、带 `x-opencode-*` 头。所以发往 `opencode.ai/zen` 的请求（`public` 兜底和自己配的 zen 节点）会自动改成这个形状——流式，外加两条永不调用的占位工具声明，HTTP 后端本身仍然不开工具。其他端点一个字节都不动。这是对面服务端的策略，他们随时可能改判据。
 
 选择顺序：`--ai <供应商[:模型]>` 参数 > 环境变量 `SHORIN_PAC_AI` > `pac config` 里的选择 > 自动探测（opencode → claude → codex → agy → miyu → public）。
+
+### 关掉 AI / Turning AI off
+
+不想用 AI 的话，两条命令都退回纯粹的包管理器包装器：
+
+- 只关这一次：`pac --no-ai <包名>`、`pacr --no-ai <包名>`。
+- 永久关掉：`pac config` 菜单第一项「AI 功能总开关」，或直接 `pac config ai off`（`pac config ai on` 打开）。开关存在 `~/.config/shorin-pac/config.json` 的 `ai_enabled` 里，老配置没有这一项时按开着算。
+
+关掉之后：
+
+- `pac` 不再审查 AUR 包，也不会每个包追问一遍「不审查直接安装?」，直接交给 paru / yay 安装。这时**不再传 `--skipreview`**，paru 自己那道 PKGBUILD 复核照常出现——你关的是 AI，不是所有复核。
+- `pacr` 不再检测残留，也不再追问。仍然想要没有 AI 的那版（纯按名称匹配的启发式）就明确写 `pacr --clean` 或 `pacr --scan`。
+- `pac --check` 是「只做 AI 审查」，和关掉 AI 自相矛盾：和 `--no-ai` 一起给会直接报错，总开关关着时会提示后退出。
+- `pac config` 本身不受开关影响，否则关掉就没法再打开了。
 
 ### 与 Miyu 互通
 

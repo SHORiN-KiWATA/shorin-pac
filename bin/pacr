@@ -59,6 +59,7 @@ fi
 SHOW_HELP=false
 QUERY_ARGS=()
 CLEAN_MODE="ask"      # ask | yes | no
+NO_AI=false           # --no-ai：本次不碰 AI，等价于把 pac config 里的总开关临时关掉
 SCAN_ONLY=false
 USE_RM=false
 AI_SPEC=""
@@ -96,6 +97,7 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[OPT_RM]="  --rm            残留直接删除，而不是移入回收站"
     MSG[OPT_AI]="  --ai <供应商[:模型]>  本次使用指定的 AI 供应商/模型"
     MSG[OPT_AI_MODEL]="  --ai-model <模型>     只更换当前供应商下的模型"
+    MSG[OPT_NO_AI]="  --no-ai         本次关闭 AI：不检测残留、不再询问（持久关闭用 pac config ai off）"
     MSG[FEAT]="功能特性："
     MSG[FEAT_1]="- 大一统架构：同屏混合显示并多选 Native 包与 Flatpak 应用"
     MSG[FEAT_2]="- 彻底与安全：Pacman 递归删除配置 (-Rns)，Flatpak 原生防误删保护"
@@ -113,6 +115,8 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[CLEAN_ASK_MODEL]="当前 AI：%s"
     MSG[CLEAN_ASK_PROMPT]="是否使用 AI 检测卸载残留? [Y/n/m] "
     MSG[AI_UNAVAILABLE]="AI 不可用（未找到可用供应商），将只按名称启发式列出残留。运行 pac config 可配置。"
+    MSG[AI_OFF]="AI 功能已关闭，跳过残留检测（要按名称启发式检测请加 --clean 或 --scan）。"
+    MSG[AI_OFF_SCAN]="AI 功能已关闭，只按名称启发式列出残留。"
     MSG[COLLECTING]=">> 正在收集..."
     MSG[TOKENS]="关键词："
     MSG[CANDIDATES]="候选：%s 项"
@@ -150,6 +154,7 @@ else
     MSG[OPT_RM]="  --rm            Delete leftovers directly instead of moving them to the trash"
     MSG[OPT_AI]="  --ai <provider[:model]>  Use this AI provider/model for this run"
     MSG[OPT_AI_MODEL]="  --ai-model <model>       Only switch the model of the current provider"
+    MSG[OPT_NO_AI]="  --no-ai         Disable AI for this run: no leftover detection, no prompt (persist with 'pac config ai off')"
     MSG[FEAT]="Features:"
     MSG[FEAT_1]="- Unified UI: Mix, multi-select and remove Native & Flatpak apps together"
     MSG[FEAT_2]="- Safe & Clean: Pacman recursive remove (-Rns), Flatpak native protection"
@@ -167,6 +172,8 @@ else
     MSG[CLEAN_ASK_MODEL]="Current AI: %s"
     MSG[CLEAN_ASK_PROMPT]="Detect leftovers with AI? [Y/n/m] "
     MSG[AI_UNAVAILABLE]="AI unavailable (no usable provider); leftovers will be listed by name heuristics only. Run 'pac config' to set one up."
+    MSG[AI_OFF]="AI features are off; skipping leftover detection (pass --clean or --scan for the name-heuristic pass)."
+    MSG[AI_OFF_SCAN]="AI features are off; listing leftovers by name heuristics only."
     MSG[COLLECTING]=">> Collecting..."
     MSG[TOKENS]="Tokens:"
     MSG[CANDIDATES]="Candidates: %s"
@@ -202,6 +209,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h) SHOW_HELP=true; shift ;;
         --clean) CLEAN_MODE="yes"; shift ;;
         --no-clean) CLEAN_MODE="no"; shift ;;
+        --no-ai) NO_AI=true; shift ;;
         --scan) SCAN_ONLY=true; CLEAN_MODE="yes"; shift ;;
         --rm) USE_RM=true; shift ;;
         --ai)
@@ -245,6 +253,7 @@ ${MSG[OPT_SCAN]}
 ${MSG[OPT_RM]}
 ${MSG[OPT_AI]}
 ${MSG[OPT_AI_MODEL]}
+${MSG[OPT_NO_AI]}
 
 Description:
   ${MSG[DESC]}
@@ -505,11 +514,22 @@ score_candidates() {
 }
 
 load_ai_lib() {
+    # 失败分两种，调用方要分开处理：AI_OFF=true 是用户自己关的（--no-ai 或
+    # pac config ai off），不算异常；其余是真的没有可用供应商。
+    AI_OFF=false
+    if [[ "$NO_AI" == true ]]; then
+        AI_OFF=true
+        return 1
+    fi
     [[ -n "$AI_LIB" ]] || return 1
     SHORIN_PAC_LOCALE="$ORIGINAL_LANG"
     # shellcheck source=/dev/null
     source "$AI_LIB"
     ai_init || return 1
+    if ! ai_enabled; then
+        AI_OFF=true
+        return 1
+    fi
     local spec="$AI_SPEC"
     if [[ -z "$spec" && -n "$AI_MODEL_OVERRIDE" ]]; then
         ai_resolve >/dev/null 2>&1 || return 1
@@ -795,12 +815,21 @@ ALL_NAMES="${PAC_PKGS[*]:-} ${FPK_PKGS[*]:-}"
 
 # --- 9. 残留检测（卸载之前） ---
 AI_LOADED=false
+AI_OFF=false
 DO_CLEAN=false
 if [[ "$CLEAN_MODE" != "no" ]]; then
     load_ai_lib || true
-    if [[ "$CLEAN_MODE" == "yes" ]]; then
+    if [[ "$AI_OFF" == true && "$CLEAN_MODE" != "yes" ]]; then
+        # 关掉 AI 的人不该再被追问一遍「要不要检测残留」；真想要没有 AI 的那版
+        # 启发式检测，明确写 --clean / --scan。
+        echo -e "\033[90m${MSG[AI_OFF]}\033[0m"
+    elif [[ "$CLEAN_MODE" == "yes" ]]; then
         DO_CLEAN=true
-        [[ "$AI_LOADED" == true ]] || echo -e "\033[33m${MSG[AI_UNAVAILABLE]}\033[0m" >&2
+        if [[ "$AI_OFF" == true ]]; then
+            echo -e "\033[33m${MSG[AI_OFF_SCAN]}\033[0m" >&2
+        elif [[ "$AI_LOADED" != true ]]; then
+            echo -e "\033[33m${MSG[AI_UNAVAILABLE]}\033[0m" >&2
+        fi
     else
         while true; do
             echo -e "\n\033[35m╭─ ${MSG[CLEAN_ASK_TITLE]}\033[0m"
