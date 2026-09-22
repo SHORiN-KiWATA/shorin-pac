@@ -4,6 +4,16 @@
 
 Simple fzf-based TUI to install and remove pacman, AUR and Flatpak packages on Arch Linux, with AI-assisted AUR review and AI-assisted leftover cleanup.
 
+## Preview 预览
+
+![](./pics/main.png)
+
+![](./pics/aur.png)
+
+![](./pics/aur-provider.png)
+
+![](./pics/result.png)
+
 ## 安装 / Install
 
 ```
@@ -15,15 +25,15 @@ pac config                  # 选择 AI 供应商和模型（可选，不配也�
 
 ## 命令 / Commands
 
-| 命令 | 作用 |
-|---|---|
-| `pac [关键词]` | 模糊搜索并安装 pacman / AUR 包，AUR 包安装前可做 AI 安全审查 |
-| `pac --check [关键词]` | 只审查 AUR 包，不安装 |
-| `pacr [关键词]` | 模糊搜索并卸载 pacman / AUR / Flatpak 包；回车后询问是否用 AI 检测家目录残留，fzf 里按 Alt+C 直接“卸载并清残留” |
-| `pacr --scan [关键词]` | 只检测并列出残留，不卸载不删除 |
-| `pacr --clean` / `--no-clean` / `--rm` | 不询问直接检测 / 跳过检测 / 残留直接删除而不是进回收站 |
-| `pac --no-ai` / `pacr --no-ai` | 本次不用 AI，见下面「关掉 AI」 |
-| `pac config` | 配置 AI 供应商和模型（菜单）；也有 `select` / `show` / `set` / `add` / `remove` / `test` / `ai` / `tools` / `miyu` 子命令 |
+| 命令                                   | 作用                                                                                                                      |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `pac [关键词]`                         | 模糊搜索并安装 pacman / AUR 包，AUR 包安装前可做 AI 安全审查                                                              |
+| `pac --check [关键词]`                 | 只审查 AUR 包，不安装                                                                                                     |
+| `pacr [关键词]`                        | 模糊搜索并卸载 pacman / AUR / Flatpak 包；回车后询问是否用 AI 检测家目录残留，fzf 里按 Alt+C 直接“卸载并清残留”           |
+| `pacr --scan [关键词]`                 | 只检测并列出残留，不卸载不删除                                                                                            |
+| `pacr --clean` / `--no-clean` / `--rm` | 不询问直接检测 / 跳过检测 / 残留直接删除而不是进回收站                                                                    |
+| `pac --no-ai` / `pacr --no-ai`         | 本次不用 AI，见下面「关掉 AI」                                                                                            |
+| `pac config`                           | 配置 AI 供应商和模型（菜单）；也有 `select` / `show` / `set` / `add` / `remove` / `test` / `ai` / `tools` / `miyu` 子命令 |
 
 ## 残留清理是怎么做的 / How leftover cleanup works
 
@@ -39,15 +49,15 @@ AI 只负责“看证据、给结论”：pac 自己收集 PKGBUILD、`.install`
 
 可用后端：
 
-| 供应商 | 说明 |
-|---|---|
-| 自定义 HTTP | OpenAI Chat Completions 兼容端点（DeepSeek、智谱、OpenRouter、Ollama…）、OpenAI Responses 端点或 Anthropic Messages 端点，在 `pac config` 里添加 |
-| `claude-code` | 本机 `claude` CLI，走 Claude 订阅额度 |
-| `codex` | 本机 `codex` CLI |
-| `antigravity` | 本机 `agy` CLI |
-| `opencode` | 本机 `opencode` CLI |
-| `miyu` | 本机 [Miyu](https://github.com/SHORiN-KiWATA/Miyu)，交给 Miyu 当前的模型路由 |
-| `public` | opencode zen 公共 key（免配置，但额度很小，常被限流，只作兜底） |
+| 供应商        | 说明                                                                                                                                             |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 自定义 HTTP   | OpenAI Chat Completions 兼容端点（DeepSeek、智谱、OpenRouter、Ollama…）、OpenAI Responses 端点或 Anthropic Messages 端点，在 `pac config` 里添加 |
+| `claude-code` | 本机 `claude` CLI，走 Claude 订阅额度                                                                                                            |
+| `codex`       | 本机 `codex` CLI                                                                                                                                 |
+| `antigravity` | 本机 `agy` CLI                                                                                                                                   |
+| `opencode`    | 本机 `opencode` CLI                                                                                                                              |
+| `miyu`        | 本机 [Miyu](https://github.com/SHORiN-KiWATA/Miyu)，交给 Miyu 当前的模型路由                                                                     |
+| `public`      | opencode zen 公共 key（免配置，但额度很小，常被限流，只作兜底）                                                                                  |
 
 本机 CLI 后端允许模型使用只读工具（读构建目录、查 AUR RPC、搜索）补充查证；`pac config tools off` 可以关闭。
 
