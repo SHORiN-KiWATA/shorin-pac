@@ -821,6 +821,18 @@ ai_cli_opencode() {
     #
     # 下面这几个开关只对「由这次调用拉起的 server」生效：2.x 连上一个别人早就起好的
     # 后台服务时它们是不算数的，这也是要 --standalone 的另一个原因。
+    #
+    # opencode run 默认放行 bash 与编辑（实测模型会直接执行 touch），所以权限必须显式给：
+    # 编辑、联网一律拒绝；关工具时 bash 全拒，只放行什么都不做的 true；开工具（只读）时再放行
+    # ls / du。不能写成 "bash":"deny" 或 {"*":"deny"}：那样 opencode 会把 shell 工具整个撤掉，
+    # Zen 免费档见不到 shell 工具就回 403（实测，见上面 ai_zen_tools_json 那段）。
+    local permission
+    if [[ "$AI_ALLOW_TOOLS" == true ]]; then
+        permission='{"permission":{"edit":"deny","webfetch":"deny","bash":{"*":"deny","true":"allow","ls":"allow","ls *":"allow","du *":"allow"}}}'
+    else
+        permission='{"permission":{"edit":"deny","webfetch":"deny","bash":{"*":"deny","true":"allow"}}}'
+    fi
+    OPENCODE_CONFIG_CONTENT="$permission" \
     OPENCODE_DISABLE_PROJECT_CONFIG=1 OPENCODE_DISABLE_CLAUDE_CODE=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 \
     ai_cli_run "$log" "$workdir" "$bin" run --standalone -m "$AI_MODEL" \
         < <(cat "$sys"; printf '\n\n---\n\n'; cat "$user") | ai_sanitize > "$out" || ai_cli_fail "$log"
@@ -828,22 +840,19 @@ ai_cli_opencode() {
 }
 
 ai_cli_miyu() {
-    # miyu --stdout ask：管道输入会拼进提示词，但有 5 万字符上限；超过时改成让 Miyu 自己读文件。
-    local sys="$1" user="$2" out="$3" workdir="$4" bin log combined size
+    # miyu --stdout ask：
+    #   --system-prompt @文件  整体替换 Miyu 的人格提示词，审查规则不再混进用户消息
+    #   --stdin               正文读到 EOF，没有管道探测那 5 万字符的上限（实测 140KB 可用），
+    #                         所以不再需要“让 Miyu 用文件工具自己去读”那条路
+    #   --no-memory           一次性的审查内容不进 Miyu 的长期记忆
+    #   --no-tools            工具关掉时加上；开着时沿用 Miyu 自己配置的工具
+    local sys="$1" user="$2" out="$3" workdir="$4" bin log
     bin=$(ai_provider_binary "$AI_PROVIDER_JSON")
     command -v "$bin" >/dev/null 2>&1 || { echo "$(ai_msg ERR_BINARY) $bin" >&2; return 1; }
     log="${out}.log"; : > "$log"
-    combined="${out}.prompt"
-    { cat "$sys"; printf '\n\n---\n\n'; cat "$user"; } > "$combined"
-    size=$(wc -m < "$combined")
-    if (( size <= 45000 )); then
-        ai_cli_run "$log" "$workdir" "$bin" --stdout ask < "$combined" | ai_sanitize > "$out" || ai_cli_fail "$log"
-    else
-        ai_cli_run "$log" "$workdir" "$bin" --stdout ask \
-            "The task is in the file ${combined}. Read that file with your file tool and follow every instruction in it exactly. Reply with the requested output only." \
-            < /dev/null | ai_sanitize > "$out" || ai_cli_fail "$log"
-    fi
-    rm -f "$combined"
+    local -a args=(--stdout ask --stdin --no-memory --system-prompt "@${sys}")
+    [[ "$AI_ALLOW_TOOLS" == true ]] || args+=(--no-tools)
+    ai_cli_run "$log" "$workdir" "$bin" "${args[@]}" < "$user" | ai_sanitize > "$out" || ai_cli_fail "$log"
     [[ -s "$out" ]] || ai_cli_fail "$log"
 }
 
@@ -1203,7 +1212,8 @@ pac config show            show current settings / 查看当前配置
 pac config set <provider[:model]>
 pac config add | remove [id]
 pac config ai on|off       enable / disable all AI features / AI 功能总开关
-pac config tools on|off    allow read-only tools on CLI backends / CLI 后端只读工具
+pac config tools on|off    read-only tools for pacr's leftover scan (AUR review never uses tools)
+                           pacr 残留检测时 CLI 后端的只读工具（AUR 审查从不开工具）
 pac config miyu on|off     import providers from Miyu / 导入 Miyu 的供应商
 pac config test            send a test message / 发一条测试消息
 pac config path            print the config file path
