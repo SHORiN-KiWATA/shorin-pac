@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# 描述： Pacman/AUR安装软件的TUI
-# Description: Pacman/AUR pkg installation TUI 
+# 描述： Pacman/AUR/Flatpak安装软件的TUI
+# Description: Pacman/AUR/Flatpak pkg installation TUI
 # ==============================================================================
 # 启用严格的错误处理机制
 set -euo pipefail
+
+# fzf 预览命令由 $SHELL 执行；固定为 bash，避免默认 shell 是 fish 等时语法不兼容
+export SHELL=$(grep -m 1 -E '^/.*/bash$' /etc/shells || echo "/bin/bash")
 
 # 按消息类别检测界面语言；LC_ALL 仍按 locale 规范拥有最高优先级
 MESSAGE_LOCALE="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
@@ -24,19 +27,39 @@ if [[ "${1:-}" == "--generate-list" ]]; then
     MSG_INSTALLED="$5"
     CACHE_TIME=3600
 
+    # FILENAME == ARGV[1] 而不是 FNR==NR：已安装列表为空时不会把数据行误读成已安装状态
     AWK_CMD='
-        FNR==NR { installed[$1]=1; next }
+        FILENAME == ARGV[1] { installed[$1]=1; next }
         {
             status = ($2 in installed) ? ci " ✔ " label r : ""
-            
-            # 先打印带有颜色的源，紧接着打印重置符 \033[0m
-            printf "%s%s%s", c, $1, r
-            
+
+            # 隐藏前缀 PKG: 供选中后识别来源（fzf 用 --with-nth 隐藏，不参与显示与搜索）
+            printf "PKG: %s%s%s", c, $1, r
+
             # 【修复】：将对齐宽度从 11 调大到 16，确保足以容纳 "archlinuxcn" 等较长源名并留出空格
             for(i=length($1); i<16; i++) printf " "
-            
+
             # 【修复】：将包名的占位从 %-30s 增大到 %-35s，让排版更宽松
             printf "%-35s %-20s %s\n", $2, $3, status
+        }
+    '
+
+    # Flatpak 行：来源 | 应用名 | App ID，来源用青色；隐藏前缀 FLTK: 供选中后识别来源
+    AWK_CMD_FLATPAK='
+        FILENAME == ARGV[1] { installed[$1]=1; next }
+        {
+            origin = $1
+            app_id = $2
+
+            $1=""; $2=""
+            name=$0
+            sub(/^[ \t]+/, "", name)
+            sub(/[ \t]+$/, "", name)
+
+            status = (app_id in installed) ? ci " ✔ " label r : ""
+            printf "FLTK: %s%s%s", cc, origin, r
+            for(i=length(origin); i<16; i++) printf " "
+            printf " %-35s %s %s\n", name, app_id, status
         }
     '
 
@@ -48,7 +71,28 @@ if [[ "${1:-}" == "--generate-list" ]]; then
         -v label="$MSG_INSTALLED" \
         "$AWK_CMD" "$INSTALLED_LIST" -
 
-    # 3. AUR 数据逻辑优化
+    # 3. Flatpak 数据（检测到 flatpak 才出现；没有 remote 或取不到数据时静默跳过）
+    #    优先用本地 AppStream 缓存秒开；缓存为空或 --refresh / Ctrl+R 时实时拉取
+    if command -v flatpak >/dev/null 2>&1; then
+        FLATPAK_INSTALLED="${INSTALLED_LIST}.flatpak"
+        flatpak list --app --columns=application > "$FLATPAK_INSTALLED" 2>/dev/null || true
+
+        FLATPAK_RAW=""
+        if [[ "$FORCE_REFRESH" != true ]]; then
+            FLATPAK_RAW=$(flatpak remote-ls --app --cached --columns=origin,application,name 2>/dev/null || true)
+        fi
+        if [[ -z "$FLATPAK_RAW" ]]; then
+            FLATPAK_RAW=$(flatpak remote-ls --app --columns=origin,application,name 2>/dev/null || true)
+        fi
+
+        if [[ -n "$FLATPAK_RAW" ]]; then
+            printf '%s\n' "$FLATPAK_RAW" | awk -v cc='\033[36m' -v ci='\033[32m' -v r='\033[0m' \
+                -v label="$MSG_INSTALLED" \
+                "$AWK_CMD_FLATPAK" "$FLATPAK_INSTALLED" -
+        fi
+    fi
+
+    # 4. AUR 数据逻辑优化
     NEED_UPDATE=false
     if [[ "$FORCE_REFRESH" == true ]] || [[ ! -s "$AUR_CACHE" ]]; then
         NEED_UPDATE=true
@@ -174,10 +218,10 @@ fi
 # --- 3. 本地化多语言字典 (使用安全的关联数组) ---
 declare -A MSG
 if [[ "$IS_CHINESE_LOCALE" == true ]]; then
-    MSG[DESC]="模糊搜索并安装软件包 (支持官方源和 AUR)。"
+    MSG[DESC]="模糊搜索并安装软件包 (支持官方源、AUR 与 Flatpak)。"
     MSG[OPTS]="选项："
     MSG[OPT_HELP]="  --help, -h    显示此帮助信息并退出"
-    MSG[OPT_REFRESH]="  --refresh, -y 强制拉取并刷新 AUR 软件包本地缓存列表"
+    MSG[OPT_REFRESH]="  --refresh, -y 强制刷新 AUR 缓存与 Flatpak 应用列表"
     MSG[OPT_CHECK]="  --check, -c   仅审查 AUR 包，不安装"
     MSG[OPT_AI]="  --ai <供应商[:模型]>  本次使用指定的 AI 供应商/模型 (例：--ai claude-code:sonnet)"
     MSG[OPT_AI_MODEL]="  --ai-model <模型>     只更换当前供应商下的模型"
@@ -187,10 +231,11 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[ENV_AI]="  SHORIN_PAC_AI=<供应商[:模型]>  等价于 --ai；持久配置请用 pac config"
     MSG[FEAT]="功能特性："
     MSG[FEAT_1]="- 准确状态：显示 [已安装] 标记"
-    MSG[FEAT_2]="- 视觉区分：蓝色(官方) 紫色(AUR)"
+    MSG[FEAT_2]="- 视觉区分：蓝色(官方) 紫色(AUR) 青色(Flatpak)"
     MSG[FEAT_3]="- 智能降级：自动探测使用 paru 或 yay"
     MSG[FEAT_4]="- 快捷刷新：fzf 界面内按 Ctrl+R 强制重载并拉取最新缓存"
     MSG[FEAT_5]="- AI 审查：AUR 包安装前用你配置的 AI 供应商审查 PKGBUILD 与附带文件"
+    MSG[FEAT_6]="- Flatpak：检测到 flatpak 时同屏搜索并安装 Flatpak 应用"
     MSG[EX]="示例："
     MSG[ERR_FZF]="错误：未找到 fzf，请先安装。"
     MSG[ERR_HELPER]="错误：未找到 paru 或 yay，请至少安装其中一个作为 AUR 助手。"
@@ -202,6 +247,7 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[ERR_NO_BASE_DEVEL]="错误：缺少 base-devel 组，构建 yay 需要它。请先执行：sudo pacman -S base-devel"
     MSG[INSTALLED]="[已安装]"
     MSG[INSTALLING]=">> 准备安装："
+    MSG[INSTALLING_FPK]=">> 准备安装 (Flatpak)："
     MSG[HEADER]="Tab:多选 | Enter:安装 | Ctrl+R:强制刷新 | Esc:退出"
     MSG[HEADER_CHECK]="Tab:多选 | Enter:审查 | Ctrl+R:强制刷新 | Esc:退出"
     MSG[EXEC]="> 正在执行: "
@@ -268,10 +314,10 @@ if [[ "$IS_CHINESE_LOCALE" == true ]]; then
     MSG[ERR_REVIEW_FILES]="错误：无法完整收集待审查的 AUR 文件。"
     MSG[REVIEW_FAILED_CONFIRM]="AUR 审查失败，仍然继续安装 %s? [y/N] "
 else
-    MSG[DESC]="Fuzzy search & install packages (Repo + AUR)."
+    MSG[DESC]="Fuzzy search & install packages (Repo + AUR + Flatpak)."
     MSG[OPTS]="Options:"
     MSG[OPT_HELP]="  --help, -h    Show this help and exit"
-    MSG[OPT_REFRESH]="  --refresh, -y Force refresh AUR package cache list"
+    MSG[OPT_REFRESH]="  --refresh, -y Force refresh AUR cache and Flatpak app list"
     MSG[OPT_CHECK]="  --check, -c   Review AUR packages only; do not install"
     MSG[OPT_AI]="  --ai <provider[:model]>  Use this AI provider/model for this run (e.g. --ai claude-code:sonnet)"
     MSG[OPT_AI_MODEL]="  --ai-model <model>       Only switch the model of the current provider"
@@ -281,10 +327,11 @@ else
     MSG[ENV_AI]="  SHORIN_PAC_AI=<provider[:model]>  Same as --ai; use 'pac config' for a persistent choice"
     MSG[FEAT]="Features:"
     MSG[FEAT_1]="- Accurate status: [Installed] tag"
-    MSG[FEAT_2]="- Visuals: Blue(Repo) Purple(AUR)"
+    MSG[FEAT_2]="- Visuals: Blue(Repo) Purple(AUR) Cyan(Flatpak)"
     MSG[FEAT_3]="- Smart Fallback: Auto-detects paru or yay"
     MSG[FEAT_4]="- Quick Refresh: Press Ctrl+R in TUI to force refresh"
     MSG[FEAT_5]="- AI review: PKGBUILD and companion files are reviewed by your configured AI provider before an AUR install"
+    MSG[FEAT_6]="- Flatpak: when flatpak is available, search & install Flatpak apps in the same TUI"
     MSG[EX]="Example:"
     MSG[ERR_FZF]="Error: fzf not found."
     MSG[ERR_HELPER]="Error: Neither paru nor yay found. Please install an AUR helper."
@@ -296,6 +343,7 @@ else
     MSG[ERR_NO_BASE_DEVEL]="Error: base-devel group missing, required to build yay. Run: sudo pacman -S base-devel"
     MSG[INSTALLED]="[Installed]"
     MSG[INSTALLING]=">> Installing:"
+    MSG[INSTALLING_FPK]=">> Installing (Flatpak):"
     MSG[HEADER]="Tab:Multi-Select | Enter:Install | Ctrl+R:Force Refresh | Esc:Exit"
     MSG[HEADER_CHECK]="Tab:Multi-Select | Enter:Review | Ctrl+R:Force Refresh | Esc:Exit"
     MSG[EXEC]="> Executing: "
@@ -389,10 +437,11 @@ ${MSG[FEAT]}
   ${MSG[FEAT_3]}
   ${MSG[FEAT_4]}
   ${MSG[FEAT_5]}
+  ${MSG[FEAT_6]}
 
 ${MSG[EX]}
   ${0##*/} firefox        # 搜索 'firefox'
-  ${0##*/} -y             # 强制刷新 AUR 列表并列出所有包
+  ${0##*/} -y             # 强制刷新 AUR 缓存与 Flatpak 列表并列出所有包
   ${0##*/} config         # 配置 AI 供应商 / configure the AI provider
 EOF_HELP
     exit 0
@@ -443,6 +492,12 @@ else
     esac
 fi
 
+# Flatpak 可用时把 Flatpak 应用一并列出与安装；不可用则保持纯 Pacman/AUR
+HAS_FLATPAK=false
+if command -v flatpak >/dev/null 2>&1; then
+    HAS_FLATPAK=true
+fi
+
 # --- 6. 异步逻辑与文件安全设置 (XDG 规范缓存) ---
 TMP_DIR=$(mktemp -d -t pac_fzf.XXXXXX)
 TARGET_FILE="${TMP_DIR}/target"
@@ -471,8 +526,21 @@ AWK_PREVIEW='{
     }
 }'
 
-# 必须在 fzf 子进程内独立执行 export LC_ALL，防止被全局 C 环境干扰导致不认中文冒号
-PREVIEW_CMD="export LC_ALL=\"$ORIGINAL_LANG\"; $AUR_HELPER --color=always -Si {1}/{2} | awk -v c=\"$(printf '\033[1;36m')\" -v r=\"$(printf '\033[0m')\" '$AWK_PREVIEW'"
+# 必须在 fzf 子进程内独立执行 export LC_ALL，防止被全局 C 环境干扰导致不认中文冒号。
+# 隐藏前缀区分来源：PKG: 走 AUR 助手的 -Si，FLTK: 走 flatpak remote-info。
+PREVIEW_CMD="
+line={}
+export LC_ALL=\"$ORIGINAL_LANG\"
+if [[ \"\$line\" == FLTK:* ]]; then
+    origin=\$(printf '%s' \"\$line\" | awk '{print \$2}')
+    app_id=\$(printf '%s' \"\$line\" | sed 's/ ✔ .*//' | awk '{print \$NF}')
+    flatpak remote-info \"\$origin\" \"\$app_id\"
+else
+    repo=\$(printf '%s' \"\$line\" | awk '{print \$2}')
+    pkg=\$(printf '%s' \"\$line\" | awk '{print \$3}')
+    $AUR_HELPER --color=always -Si \"\$repo/\$pkg\"
+fi | awk -v c=\"$(printf '\033[1;36m')\" -v r=\"$(printf '\033[0m')\" '$AWK_PREVIEW'
+"
 
 aur_build_dir() {
     local pkg="$1"
@@ -1152,11 +1220,15 @@ PID_GEN=$!
 
 # --- 8. 交互式 FZF 渲染 ---
 COLOR_YELLOW=$'\033[33m'
+COLOR_CYAN=$'\033[36m'
 COLOR_RESET=$'\033[0m'
 if [[ "$CHECK_ONLY" == true ]]; then
     FZF_HEADER="${MSG[HEADER_CHECK]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
 else
     FZF_HEADER="${MSG[HEADER]} | ${COLOR_YELLOW}Using ${AUR_HELPER}${COLOR_RESET}"
+fi
+if [[ "$HAS_FLATPAK" == true ]]; then
+    FZF_HEADER+=" & ${COLOR_CYAN}Flatpak${COLOR_RESET}"
 fi
 
 # 构造安全的 reload 命令
@@ -1170,6 +1242,7 @@ fzf --multi --ansi \
     --bind "alt-j:last,alt-k:first" \
     --bind "ctrl-r:reload($RELOAD_CMD)" \
     --tiebreak=index \
+    --with-nth=2.. \
     --header "$FZF_HEADER" \
     --query "${QUERY_ARGS[*]:-}" \
     < "$PIPE_FIFO" \
@@ -1182,10 +1255,17 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
     mapfile -t SELECTED_LINES < "$TARGET_FILE"
     REPO_PACKAGES=()
     AUR_PACKAGES=()
+    FPK_PACKAGES=()
     for line in "${SELECTED_LINES[@]}"; do
         clean=$(echo "$line" | sed $'s/\033\\[[0-9;]*[a-zA-Z]//g')
-        repo=$(echo "$clean" | awk '{print $1}')
-        pkg=$(echo "$clean" | awk '{print $2}')
+        # Flatpak 行没有仓库与版本，App ID 在去掉 [已安装] 状态标记后取最后一列
+        if [[ "$clean" == FLTK:* ]]; then
+            app_id=$(echo "$clean" | sed 's/ ✔ .*//' | awk '{print $NF}')
+            [[ -n "$app_id" ]] && FPK_PACKAGES+=("$app_id")
+            continue
+        fi
+        repo=$(echo "$clean" | awk '{print $2}')
+        pkg=$(echo "$clean" | awk '{print $3}')
         if [[ -z "$repo" || -z "$pkg" ]]; then
             continue
         elif [[ "$repo" == "aur" ]]; then
@@ -1194,23 +1274,44 @@ if [[ $FZF_EXIT -eq 0 ]] && [[ -s "$TARGET_FILE" ]]; then
             REPO_PACKAGES+=("$repo/$pkg")
         fi
     done
-    
-    if [[ ${#REPO_PACKAGES[@]} -gt 0 && "$CHECK_ONLY" == true ]]; then
-        echo -e "\033[33m${MSG[CHECK_SKIP_REPO]}\033[0m"
-        echo "${REPO_PACKAGES[*]}"
-    elif [[ ${#REPO_PACKAGES[@]} -gt 0 ]]; then
-        FINAL_CMD="$AUR_HELPER -S ${REPO_PACKAGES[*]}"
 
-        echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
-        echo "${REPO_PACKAGES[*]}"
-        echo "----------------------------------------"
-        echo -e "\033[90m${MSG[EXEC]}$FINAL_CMD\033[0m\n"
+    if [[ "$CHECK_ONLY" == true ]]; then
+        # 仅审查模式只处理 AUR；官方源与 Flatpak 都跳过
+        if [[ ${#REPO_PACKAGES[@]} -gt 0 || ${#FPK_PACKAGES[@]} -gt 0 ]]; then
+            echo -e "\033[33m${MSG[CHECK_SKIP_REPO]}\033[0m"
+            [[ ${#REPO_PACKAGES[@]} -eq 0 ]] || echo "${REPO_PACKAGES[*]}"
+            [[ ${#FPK_PACKAGES[@]} -eq 0 ]] || echo "${FPK_PACKAGES[*]}"
+        fi
+    else
+        if [[ ${#REPO_PACKAGES[@]} -gt 0 ]]; then
+            FINAL_CMD="$AUR_HELPER -S ${REPO_PACKAGES[*]}"
 
-        LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" -S "${REPO_PACKAGES[@]}"
+            echo -e "\n\033[32m${MSG[INSTALLING]}\033[0m"
+            echo "${REPO_PACKAGES[*]}"
+            echo "----------------------------------------"
+            echo -e "\033[90m${MSG[EXEC]}$FINAL_CMD\033[0m\n"
 
-        echo "----------------------------------------"
-        echo -e "\033[36m${MSG[HINT]}\033[0m"
-        echo -e "\033[1;33m$FINAL_CMD\033[0m\n"
+            LC_ALL="$ORIGINAL_LANG" "$AUR_HELPER" -S "${REPO_PACKAGES[@]}"
+
+            echo "----------------------------------------"
+            echo -e "\033[36m${MSG[HINT]}\033[0m"
+            echo -e "\033[1;33m$FINAL_CMD\033[0m\n"
+        fi
+
+        if [[ ${#FPK_PACKAGES[@]} -gt 0 ]]; then
+            FINAL_CMD="flatpak install ${FPK_PACKAGES[*]}"
+
+            echo -e "\n\033[36m${MSG[INSTALLING_FPK]}\033[0m"
+            echo "${FPK_PACKAGES[*]}"
+            echo "----------------------------------------"
+            echo -e "\033[90m${MSG[EXEC]}$FINAL_CMD\033[0m\n"
+
+            LC_ALL="$ORIGINAL_LANG" flatpak install "${FPK_PACKAGES[@]}"
+
+            echo "----------------------------------------"
+            echo -e "\033[36m${MSG[HINT]}\033[0m"
+            echo -e "\033[1;33m$FINAL_CMD\033[0m\n"
+        fi
     fi
 
     if [[ ${#AUR_PACKAGES[@]} -gt 0 ]]; then
