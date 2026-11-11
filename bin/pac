@@ -34,10 +34,10 @@ if [[ "${1:-}" == "--generate-list" ]]; then
             status = ($2 in installed) ? ci " ✔ " label r : ""
 
             # 隐藏前缀 PKG: 供选中后识别来源（fzf 用 --with-nth 隐藏，不参与显示与搜索）
-            printf "PKG: %s%s%s", c, $1, r
+            printf "PKG: %s%s%s ", c, $1, r
 
             # 【修复】：将对齐宽度从 11 调大到 16，确保足以容纳 "archlinuxcn" 等较长源名并留出空格
-            for(i=length($1); i<16; i++) printf " "
+            for(i=length($1)+1; i<17; i++) printf " "
 
             # 【修复】：将包名的占位从 %-30s 增大到 %-35s，让排版更宽松
             printf "%-35s %-20s %s\n", $2, $3, status
